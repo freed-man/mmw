@@ -46,9 +46,21 @@ one.
 Measured on one reg, cold, headless: 10.4s before this, 3.4s after, of which
 0.7s is Chrome booting and 0.7s is the site answering. Neither is ours.
 
-What remains is the throttle between regs, which is deliberate rather than
-accidental: `--delay 1` will halve it, and the default stays at two to four
-seconds.
+What remains is under your control rather than the code's. On a forty reg run
+the lookups took 35s and the throttle took 39s, so more than half the wall
+clock is a politeness setting.
+
+`--delay 1` halves the gap. `--concurrency 4` sends four regs in one round trip
+via `Promise.all` inside the page. The first reg always runs alone: if its
+answer came from the response body (`source: fetch:json`) the rest can be
+batched, and if it came from the cookie (`fetch:cookie`) they cannot, because
+one cookie cannot answer for four regs at once. That is why the source label
+distinguishes the two. Any reg in a batch whose body settles nothing is retried
+on its own rather than written off.
+
+Together those take a forty reg run from about 78s to roughly 25s. Note what
+that does to request rate before using it on a large batch: four requests at
+once against someone else's free endpoint is a different kind of guest.
 
 ## How it reads the answer
 

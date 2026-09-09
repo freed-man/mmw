@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import csv
 import json
 import random
@@ -358,6 +359,34 @@ FETCH_JS = """async (reg) => {
     }
 }""" % LOOKUP_PATH
 
+BATCH_FETCH_JS = """async (regs) => {
+    const hit = document.cookie.split(';')
+        .map(c => c.trim())
+        .find(c => c.startsWith('form_key='));
+    if (!hit) return {ok: false, why: 'no form_key cookie'};
+    const key = decodeURIComponent(hit.slice('form_key='.length));
+    const one = async (reg) => {
+        const body = new URLSearchParams();
+        body.set('data[registration]', reg);
+        body.set('data[form_key]', key);
+        body.set('form_key', key);
+        try {
+            const r = await fetch('%s', {
+                method: 'POST',
+                headers: {'X-Requested-With': 'XMLHttpRequest',
+                          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+                body: body.toString(),
+                credentials: 'same-origin',
+            });
+            return {reg: reg, ok: true, status: r.status,
+                    text: (await r.text()).slice(0, 4000)};
+        } catch (e) {
+            return {reg: reg, ok: false, why: String(e)};
+        }
+    };
+    return {ok: true, results: await Promise.all(regs.map(one))};
+}""" % LOOKUP_PATH
+
 READ_ROWS_JS = f"""() => Array.from(
     document.querySelectorAll('{SEL_RESULT} .info-row')
 ).map(r => [
@@ -513,6 +542,63 @@ async def _reset(page) -> None:
     await _wait_for_ko(page)
 
 
+def blank_row(reg: str) -> dict:
+    return {"reg": reg, "outcome": "error", "code": None, "colour": None,
+            "vehicle": None, "source": None, "detail": None, "ms": 0}
+
+
+def row_from_response(res: dict, seeded: bool) -> Optional[dict]:
+    """One endpoint response to a row, using only the response body. No cookie,
+    so this works for several regs answered at once. Returns None when the body
+    settles nothing and the caller should fall back."""
+    if not res.get("ok"):
+        return None
+    if res.get("status") != 200:
+        if res.get("status") == 403 and not seeded:
+            return {"outcome": "blocked", "source": "fetch:json",
+                    "detail": "endpoint returned 403"}
+        return None  # seeded key refused, or anything else: fall back
+
+    text = res.get("text") or ""
+    try:
+        ans = search_answer(json.loads(text))
+    except Exception:
+        ans = None
+    if ans:
+        return {**ans, "outcome": "ok", "source": "fetch:json"}
+    if is_not_found_text(text):
+        low = text.lower()
+        unknown = "not found" in low and "paints" not in low
+        return {"outcome": "unknown_vehicle" if unknown else "not_found",
+                "source": "fetch:json", "detail": " ".join(text.split())[:200]}
+    return None
+
+
+async def lookup_batch(page, regs: list[str], seeded: bool,
+                       debug: bool) -> dict[str, dict]:
+    """Several regs in one round trip. Only the response body is read, so any
+    reg whose body settles nothing comes back missing and is retried serially
+    by the caller."""
+    started = time.monotonic()
+    out: dict[str, dict] = {}
+    try:
+        res = await page.evaluate(BATCH_FETCH_JS, regs)
+    except Exception as exc:
+        if debug:
+            print(f"  batch threw: {type(exc).__name__}")
+        return out
+    if not res.get("ok"):
+        if debug:
+            print(f"  batch refused: {res.get('why')}")
+        return out
+    each = int((time.monotonic() - started) * 1000 / max(len(regs), 1))
+    for item in res.get("results", []):
+        row = row_from_response(item, seeded)
+        if row:
+            out[item["reg"]] = {**blank_row(item["reg"]), **row, "ms": each}
+    return out
+
+
 async def _lookup_via_fetch(page, ctx, reg: str, before: Optional[str],
                             debug: bool, seeded: bool = False) -> Optional[dict]:
     """Returns a row update, or None to fall back to driving the form."""
@@ -524,39 +610,25 @@ async def _lookup_via_fetch(page, ctx, reg: str, before: Optional[str],
         return None
     if debug:
         print(f"  fetch: {str(res)[:220]}")
-    if not res.get("ok"):
-        return None
-    if res.get("status") != 200:
-        if res.get("status") == 403 and not seeded:
-            return {"outcome": "blocked", "source": "fetch",
-                    "detail": "endpoint returned 403"}
-        return None  # seeded key refused, or anything else: fall back
 
-    text = res.get("text") or ""
-    ans = None
-    try:
-        ans = search_answer(json.loads(text))
-    except Exception:
-        pass
-    if not ans:
-        # The endpoint sets the cookie on its response, so read that instead.
-        ans = fresh_cookie_answer(await _cookie_value(ctx), before, reg)
+    row = row_from_response(res, seeded)
+    if row:
+        return row
+    if not res.get("ok") or res.get("status") != 200:
+        return None
+    # The body settled nothing. The endpoint also sets the cookie on its
+    # response, so read that. This is the path that cannot be parallelised:
+    # one cookie cannot answer for several regs at once.
+    ans = fresh_cookie_answer(await _cookie_value(ctx), before, reg)
     if ans:
-        return {**ans, "outcome": "ok", "source": "fetch"}
-    if is_not_found_text(text):
-        low = text.lower()
-        unknown = "not found" in low and "paints" not in low
-        return {"outcome": "unknown_vehicle" if unknown else "not_found",
-                "source": "fetch", "detail": " ".join(text.split())[:200]}
+        return {**ans, "outcome": "ok", "source": "fetch:cookie"}
     return None
 
 
 async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict,
                      slow: bool = False) -> dict:
     started = time.monotonic()
-    row: dict[str, Any] = {"reg": reg, "outcome": "error", "code": None,
-                           "colour": None, "vehicle": None, "source": None,
-                           "detail": None, "ms": 0}
+    row: dict[str, Any] = blank_row(reg)
     try:
         if not slow:
             before = await _cookie_value(ctx)
@@ -755,7 +827,7 @@ async def _debug_report(page, ctx, trace: dict) -> None:
 async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
               profile: Optional[str], chromium_only: bool,
               block_assets: bool, offscreen: bool, slow: bool,
-              delay: Optional[float]) -> list[dict]:
+              delay: Optional[float], concurrency: int) -> list[dict]:
     from playwright.async_api import async_playwright
 
     rows: list[dict] = []
@@ -927,27 +999,66 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
             except Exception:
                 pass
 
-        for n, reg in enumerate(regs, 1):
-            row = await lookup_one(page, ctx, reg, debug, trace, slow)
+        def emit(n: int, row: dict) -> None:
             rows.append(row)
-            print(f"[{n}/{len(regs)}] {reg:<8} {row['outcome']:<10} "
+            print(f"[{n}/{len(regs)}] {row['reg']:<8} {row['outcome']:<10} "
                   f"{row['code'] or '':<8} {row['ms']:>5}ms  "
                   f"{row['vehicle'] or row['detail'] or ''}")
             if out:
                 _append_csv(out, row)
-            if debug:
-                await _debug_report(page, ctx, trace)
-            if row["outcome"] == "blocked":
-                print("stopping: challenged mid run")
-                break
-            if n < len(regs):
-                if row.get("source") != "fetch":
+
+        async def pause() -> None:
+            lo, hi = DELAY_S if delay is None else (delay * 0.75, delay * 1.25)
+            await asyncio.sleep(random.uniform(lo, hi))
+
+        n = 0
+        queue = list(regs)
+        stopped = False
+
+        # The first reg always runs on its own. Whether its answer came out of
+        # the response body or out of the cookie decides if the rest can be
+        # batched, and guessing that would be guessing.
+        while queue and not stopped:
+            batch_size = 1
+            if concurrency > 1 and trace.get("json_ok") and not slow:
+                batch_size = min(concurrency, len(queue))
+
+            if batch_size == 1:
+                reg = queue.pop(0)
+                n += 1
+                row = await lookup_one(page, ctx, reg, debug, trace, slow)
+                if row.get("source") == "fetch:json":
+                    trace["json_ok"] = True
+                emit(n, row)
+                if debug:
+                    await _debug_report(page, ctx, trace)
+                if row["outcome"] == "blocked":
+                    print("stopping: challenged mid run")
+                    stopped = True
+                    break
+                if not (row.get("source") or "").startswith("fetch"):
                     await _reset(page)
                 if slow and n % RELOAD_EVERY == 0:
                     await page.goto(URL, wait_until="load")
                     await _wait_for_ko(page)
-                lo, hi = DELAY_S if delay is None else (delay * 0.75, delay * 1.25)
-                await asyncio.sleep(random.uniform(lo, hi))
+            else:
+                chunk = [queue.pop(0) for _ in range(batch_size)]
+                got = await lookup_batch(page, chunk, trace.get("seeded", False), debug)
+                for reg in chunk:
+                    row = got.get(reg)
+                    if row is None:
+                        # Body settled nothing for this one; it earns a serial
+                        # run rather than being written off.
+                        row = await lookup_one(page, ctx, reg, debug, trace, slow)
+                    n += 1
+                    emit(n, row)
+                    if row["outcome"] == "blocked":
+                        print("stopping: challenged mid run")
+                        stopped = True
+                        break
+
+            if queue and not stopped:
+                await pause()
 
         t_close = time.monotonic()
         await asyncio.gather(*pending, return_exceptions=True)
@@ -1144,6 +1255,27 @@ def selftest() -> int:
     check("form key cookie is scoped to the site",
           form_key_cookie("x")["domain"] == ".mymotorworld.com")
 
+    hit = row_from_response({"ok": True, "status": 200, "text": json.dumps(
+        {"paint_code": "A7N", "colour": "GREY",
+         "vehicle_details": "Volkswagen Golf 2014"})}, False)
+    check("json body answers", hit and hit["source"] == "fetch:json"
+          and hit["code"] == "A7N")
+    miss = row_from_response({"ok": True, "status": 200, "text": json.dumps(
+        {"error": "Sorry, couldn't find paints for AB12CDE."})}, False)
+    check("paint miss is not_found", miss and miss["outcome"] == "not_found")
+    gone = row_from_response({"ok": True, "status": 200, "text": json.dumps(
+        {"error": "Sorry, vehicle AB12CDE not found."})}, False)
+    check("vehicle miss is unknown_vehicle", gone
+          and gone["outcome"] == "unknown_vehicle")
+    check("empty body falls back", row_from_response(
+        {"ok": True, "status": 200, "text": "{}"}, False) is None)
+    check("seeded 403 falls back rather than reporting blocked",
+          row_from_response({"ok": True, "status": 403, "text": ""}, True) is None)
+    check("unseeded 403 reports blocked", row_from_response(
+        {"ok": True, "status": 403, "text": ""}, False)["outcome"] == "blocked")
+    check("batch js targets the endpoint", LOOKUP_PATH in BATCH_FETCH_JS)
+    check("batch js is parallel", "Promise.all" in BATCH_FETCH_JS)
+
     check("fetch js targets the endpoint", LOOKUP_PATH in FETCH_JS)
     check("fetch js sends both form key fields",
           "data[form_key]" in FETCH_JS and "form_key" in FETCH_JS)
@@ -1193,6 +1325,9 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true", help="full diagnostic report")
     ap.add_argument("--slow", action="store_true",
                     help="drive the form instead of calling the endpoint directly")
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="regs per round trip once the endpoint is proven to "
+                         "answer in its response body (default 1)")
     ap.add_argument("--delay", type=float, default=None,
                     help="mean seconds between lookups (default 3, jittered)")
     ap.add_argument("--offscreen", action="store_true",
@@ -1250,14 +1385,17 @@ def main() -> int:
         return 0
 
     rows = asyncio.run(run(regs, a.headed, out, a.debug, a.profile,
-                           a.chromium, a.block, a.offscreen, a.slow, a.delay))
+                           a.chromium, a.block, a.offscreen, a.slow, a.delay,
+                           max(1, a.concurrency)))
     if expected:
         _report(rows, expected)
     elif len(rows) == 1 and not out:
         print(json.dumps(rows[0], indent=2))
     else:
         ok = sum(1 for r in rows if r["outcome"] == "ok")
-        print(f"{ok}/{len(rows)} ok  ->  {out}")
+        srcs = collections.Counter(r.get("source") or "-" for r in rows)
+        print(f"{ok}/{len(rows)} ok  ->  {out}   "
+              f"({', '.join(f'{n} {k}' for k, n in srcs.most_common())})")
     return 0
 
 
