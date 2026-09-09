@@ -93,7 +93,12 @@ SEL_OVERLAY_DISMISS = ('button:visible:has-text("Later")',
 PUSH_HOSTS = re.compile(r"(smct\.io|smartech|netcorecloud|smtcdn)")
 
 NOT_FOUND_MARKERS = ("not found", "check entry", "no match", "unable to find",
-                     "could not find", "no vehicle")
+                     "could not find", "couldn't find", "no vehicle")
+
+# Their two messages mean different things and the difference is the useful
+# part: "vehicle X not found" is their vehicle lookup failing, "couldn't find
+# paints for X" is the vehicle resolving with no paint data behind it.
+UNKNOWN_VEHICLE_MARKERS = ("vehicle", "not found")
 
 BLOCK_FRAGMENTS = (
     "googletagmanager", "google-analytics", "doubleclick", "facebook.net",
@@ -222,17 +227,26 @@ def rows_answer(rows: list[list[str]]) -> Optional[dict[str, Optional[str]]]:
     return out if out["code"] else None
 
 
+# Catalogue prefixes that carry no colour information. L is the VAG lacquer
+# prefix (LA7N against A7N). OV and TE are Renault and Dacia catalogue
+# prefixes (OV369 against 369, TEGNE against GNE). All three were confirmed
+# against codes three or more independent providers agreed on.
+CODE_PREFIXES = ("OV", "TE", "L")
+
+
+def code_stem(x: Optional[str]) -> str:
+    if not x:
+        return ""
+    s = re.sub(r"[^A-Z0-9]", "", str(x).upper())
+    for p in sorted(CODE_PREFIXES, key=len, reverse=True):
+        # Never strip down to something too short to be distinctive.
+        if s.startswith(p) and len(s) - len(p) >= 3:
+            return s[len(p):]
+    return s
+
+
 def codes_match(a: Optional[str], b: Optional[str]) -> bool:
-    """VAG codes come back without the L prefix: the site returns A7N where the
-    dealer gives LA7N, and Z9Y where Audi gives LZ9Y. Compare on the stem."""
-    def stem(x: Optional[str]) -> str:
-        if not x:
-            return ""
-        s = re.sub(r"[^A-Z0-9]", "", str(x).upper())
-        if len(s) > 3 and s.startswith("L") and s[1].isalpha():
-            s = s[1:]
-        return s
-    sa, sb = stem(a), stem(b)
+    sa, sb = code_stem(a), code_stem(b)
     return bool(sa) and sa == sb
 
 
@@ -530,8 +544,10 @@ async def _lookup_via_fetch(page, ctx, reg: str, before: Optional[str],
     if ans:
         return {**ans, "outcome": "ok", "source": "fetch"}
     if is_not_found_text(text):
-        return {"outcome": "not_found", "source": "fetch",
-                "detail": " ".join(text.split())[:200]}
+        low = text.lower()
+        unknown = "not found" in low and "paints" not in low
+        return {"outcome": "unknown_vehicle" if unknown else "not_found",
+                "source": "fetch", "detail": " ".join(text.split())[:200]}
     return None
 
 
@@ -1094,6 +1110,20 @@ def selftest() -> int:
           search_answer({"paint_code": "ENTER REG"}) is None)
     check("endpoint list payload", search_answer(
         [{"data": [{"paint_code": "OVDQH"}]}])["code"] == "OVDQH")
+
+    check("renault prefix OV369/369", codes_match("OV369", "369"))
+    check("renault prefix TEGNE/GNE", codes_match("TEGNE", "GNE"))
+    check("dacia scheme difference is not a match",
+          not codes_match("TERQH", "141D7N"))
+    check("dacia scheme difference is not a match either",
+          not codes_match("TEFAA", "141DC3"))
+    check("ford scheme difference is not a match",
+          not codes_match("PN4A7", "7236/BRQA"))
+    check("ford exact still matches", codes_match("PN4GM", "PN4GM"))
+    check("prefix is not stripped below three chars", not codes_match("TEG", "G"))
+    check("vehicle miss is separated from paint miss",
+          is_not_found_text("Sorry, vehicle NHA64P not found.") and
+          is_not_found_text("Sorry, couldn't find paints for LG73FAC."))
 
     check("VAG prefix match LA7N/A7N", codes_match("LA7N", "A7N"))
     check("VAG prefix match LZ9Y/Z9Y", codes_match("LZ9Y", "Z9Y"))
