@@ -60,9 +60,32 @@ SEL_GO = "#paint-vrm-search"
 SEL_RESET = "#vrm-remove, #paint-vrm-reset"
 SEL_RESULT = ".selected-paint-vrm-details"
 SEL_HAS_VEHICLE = ".has-paintvehicle"
-SEL_POPUP = '.modal-popup, [role="dialog"], .swal2-popup, .message-error, .mage-error'
-SEL_POPUP_CLOSE = ('button[data-role="closeBtn"]', ".modal-popup .action-close",
-                   'button:has-text("OK")', ".swal2-confirm")
+# :visible on every one of these. Magento keeps several hidden .modal-popup
+# elements in the DOM, so .first without it lands on one that is not on screen.
+# [role="dialog"] is deliberately absent: the cookie notice uses it too.
+SEL_POPUP = ('.modal-popup:visible, .modal-inner-wrap:visible, .swal2-popup:visible, '
+             '.message-error:visible, .mage-error:visible')
+SEL_POPUP_CLOSE = ('.modal-popup:visible .action-primary',
+                   'button[data-role="closeBtn"]:visible',
+                   '.modal-popup:visible .action-close',
+                   'button:visible:has-text("OK")',
+                   '.swal2-confirm:visible')
+
+# The push notification prompt is a vendor overlay that sits over the widget.
+# Blocked at the network level below; these are the backstop if it renders.
+SEL_OVERLAY_DISMISS = ('button:visible:has-text("Later")',
+                       'a:visible:has-text("Later")',
+                       '[role="button"]:visible:has-text("Later")',
+                       'button:visible:has-text("Not now")',
+                       'button:visible:has-text("No thanks")')
+
+# Third party push and chat vendors, seen in the cookie jar and the CSP errors.
+# Routing is scoped to these hosts only, so same origin requests are never
+# intercepted and cannot pick up the 403 that full interception caused.
+PUSH_HOSTS = re.compile(r"(smct\.io|smartech|netcorecloud|smtcdn)")
+
+NOT_FOUND_MARKERS = ("not found", "check entry", "no match", "unable to find",
+                     "could not find", "no vehicle")
 
 BLOCK_FRAGMENTS = (
     "googletagmanager", "google-analytics", "doubleclick", "facebook.net",
@@ -155,6 +178,13 @@ def search_answer(payload: Any) -> Optional[dict[str, Optional[str]]]:
 
     visit(payload)
     return found if found["code"] else None
+
+
+def is_not_found_text(text: Optional[str]) -> bool:
+    """A visible modal is not automatically a miss. The site's own message is
+    "Sorry, vehicle XY13FGH not found. Please check entry or try using the
+    selector."; a cookie notice or a newsletter box must not be read as one."""
+    return bool(text) and any(m in text.lower() for m in NOT_FOUND_MARKERS)
 
 
 def fresh_cookie_answer(value: Optional[str], baseline: Optional[str],
@@ -312,6 +342,26 @@ async def _popup_text(page) -> Optional[str]:
     return None
 
 
+async def _clear_overlays(page) -> None:
+    """The push prompt and the cookie notice both sit over the widget. The
+    notice is info only with no reject control, so it is hidden rather than
+    accepted; nothing here clicks a consent button."""
+    try:
+        await page.evaluate(
+            "() => { for (const e of document.querySelectorAll("
+            "'.cc-window, .cc-banner')) e.style.display = 'none'; }")
+    except Exception:
+        pass
+    for sel in SEL_OVERLAY_DISMISS:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=300):
+                await loc.click()
+                return
+        except Exception:
+            continue
+
+
 async def _dismiss_popup(page) -> None:
     for sel in SEL_POPUP_CLOSE:
         try:
@@ -380,6 +430,8 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
             return row
         if debug:
             print(f"  ko ready after {ko.get('waited_s')}s {ko}")
+
+        await _clear_overlays(page)
 
         # A restored result from a previous run must go before anything is
         # submitted, or it can be read as this reg's answer.
@@ -459,9 +511,14 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
 
             popup = await _popup_text(page)
             if popup:
-                row.update(outcome="not_found", detail=popup, source="popup")
+                if is_not_found_text(popup):
+                    row.update(outcome="not_found", detail=popup, source="popup")
+                    await _dismiss_popup(page)
+                    break
+                # something else on screen, clear it and keep waiting
+                if debug:
+                    print(f"  dismissing unrelated overlay: {popup[:80]}")
                 await _dismiss_popup(page)
-                break
 
             if trace.get("navigated"):
                 # Native submit: KO was not bound, or it rebound mid click.
@@ -570,6 +627,11 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
         await ctx.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         await ctx.add_cookies([consent_cookie()])
+
+        async def kill(route):
+            await route.abort()
+
+        await ctx.route(PUSH_HOSTS, kill)
 
         # Interception rewrites every request, which is itself a signal. Off by
         # default now; --block turns the tracker filtering back on.
@@ -779,6 +841,19 @@ def selftest() -> int:
     check("dom rows without a code yield nothing",
           rows_answer([["Vehicle:", "VW Golf"], ["Colour:", "GREY"]]) is None)
     check("dom placeholder yields nothing", rows_answer([["Paint Code:", "ENTER REG"]]) is None)
+
+    check("site miss message reads as not found",
+          is_not_found_text("Sorry, vehicle XY13FGH not found. Please check "
+                            "entry or try using the selector."))
+    check("cookie notice does not read as not found",
+          not is_not_found_text("Our site uses cookies to give you the best "
+                                "shopping experience. Continue if you're happy."))
+    check("push prompt does not read as not found",
+          not is_not_found_text("Subscribe to our notifications for the latest "
+                                "offers & deals. You can disable anytime."))
+    check("empty modal does not read as not found", not is_not_found_text(""))
+    check("popup selector excludes role=dialog", 'role="dialog"' not in SEL_POPUP)
+    check("popup selector is visible scoped", SEL_POPUP.count(":visible") == 5)
 
     check("stale cookie identical to baseline is refused",
           fresh_cookie_answer(live, live, "WP09UOU") is None)
