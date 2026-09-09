@@ -1,0 +1,853 @@
+"""
+mmw.py  reg to paint code. One page held open, one reg after another.
+
+    python mmw.py GM14DKE --headed              one reg, prints JSON
+    python mmw.py GM14DKE --headed --debug      full diagnostic report
+    python mmw.py --file regs.txt               batch, appends to results.csv
+    python mmw.py --file regs.txt --expect verified.csv    accuracy run
+    python mmw.py --selftest                    pure function checks, no network
+
+The answer is read from the site's own `paint_search_data` cookie, written on
+every successful lookup:
+
+    {"vehicle_details":"Volkswagen Golf 2014 1.6 Diesel",
+     "colour":"GREY","paint_code":"A7N","reg_no":"gm14dke"}
+
+It carries the reg it belongs to, so it is only accepted when `reg_no` matches
+the reg just submitted. Structured DOM read of the result panel is the fallback.
+
+The widget is Knockout. The form's submit handler and the input's value binding
+do not exist until KO applies its bindings, and clicking go before that moment
+makes the browser do a plain native form submit: the page reloads with the reg
+in the query string, KO starts fresh with an empty field, and nothing ever
+appears. So every lookup waits for KO to own the input before touching it, and
+a navigation after submit is reported rather than waited out.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import json
+import random
+import re
+import secrets
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any, Optional
+
+URL = "https://www.mymotorworld.com/car-paint-by-reg"
+ORIGIN = "mymotorworld.com"
+COOKIE_NAME = "paint_search_data"
+
+# The widget's own endpoint, seen in the network trace. Form encoded:
+#   data[registration]=GM14DKE&data[form_key]=<form_key>&form_key=<form_key>
+# Its response is read directly when it comes back 200, which is faster and
+# more certain than waiting for the cookie to be rewritten.
+LOOKUP_PATH = "/paintmatching/colour/search"
+
+DEADLINE_S = 25.0
+KO_DEADLINE_S = 25.0
+POLL_S = 0.25
+RESUBMIT_AFTER_S = 8.0
+DELAY_S = (2.0, 4.0)
+RELOAD_EVERY = 40
+
+SEL_INPUT = "#paint-vrm-reg"
+SEL_GO = "#paint-vrm-search"
+SEL_RESET = "#vrm-remove, #paint-vrm-reset"
+SEL_RESULT = ".selected-paint-vrm-details"
+SEL_HAS_VEHICLE = ".has-paintvehicle"
+SEL_POPUP = '.modal-popup, [role="dialog"], .swal2-popup, .message-error, .mage-error'
+SEL_POPUP_CLOSE = ('button[data-role="closeBtn"]', ".modal-popup .action-close",
+                   'button:has-text("OK")', ".swal2-confirm")
+
+BLOCK_FRAGMENTS = (
+    "googletagmanager", "google-analytics", "doubleclick", "facebook.net",
+    "clarity.ms", "bat.bing.com", "klaviyo", "smartech", "netcorecloud",
+    "hotjar", "tiktok", "nr-data.net", "js-agent.newrelic.com", "reviews.co.uk",
+)
+
+CF_MARKERS = ("just a moment", "attention required", "cf-challenge",
+              "checking your browser", "verify you are human")
+
+PLACEHOLDERS = {"ENTER REG", "ENTER YOUR REG", "N/A", "TBC", "UNKNOWN", "-", ""}
+CODE_SHAPE = re.compile(r"^[A-Z0-9][A-Z0-9 ./\-]{0,19}$")
+REG_CLEAN = re.compile(r"[^A-Z0-9]")
+
+
+# ---------------------------------------------------------------------------
+# pure functions, all covered by --selftest
+# ---------------------------------------------------------------------------
+
+def normalise_reg(reg: Optional[str]) -> str:
+    return REG_CLEAN.sub("", (reg or "").upper())
+
+
+def is_valid_code(raw: Optional[str]) -> bool:
+    """No digit requirement: digit free codes are real (Dacia OVDQH is dealer
+    confirmed). Length and shape carry the check."""
+    if not raw:
+        return False
+    code = str(raw).strip().upper()
+    if code in PLACEHOLDERS or not (2 <= len(code) <= 20):
+        return False
+    if not CODE_SHAPE.match(code):
+        return False
+    if code.isalpha() and len(code) > 12:
+        return False
+    return True
+
+
+def parse_cookie(value: Optional[str]) -> dict[str, str]:
+    if not value:
+        return {}
+    try:
+        data = json.loads(urllib.parse.unquote(value))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def cookie_answer(value: Optional[str], reg: str) -> Optional[dict[str, str]]:
+    """Only accept the cookie if it is about the reg we just submitted."""
+    data = parse_cookie(value)
+    if not data:
+        return None
+    if normalise_reg(data.get("reg_no")) != normalise_reg(reg):
+        return None
+    code = str(data.get("paint_code", "")).strip().upper()
+    if not is_valid_code(code):
+        return None
+    return {"code": code,
+            "colour": (data.get("colour") or "").strip() or None,
+            "vehicle": (data.get("vehicle_details") or "").strip() or None}
+
+
+def search_answer(payload: Any) -> Optional[dict[str, Optional[str]]]:
+    """Pull the three fields out of the lookup endpoint's response. The shape is
+    not fully known, so this walks nested dicts and lists rather than assuming
+    one, and mirrors the key names the cookie uses."""
+    found: dict[str, Optional[str]] = {"code": None, "colour": None, "vehicle": None}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                key = str(k).lower()
+                if isinstance(v, (str, int, float)):
+                    val = str(v).strip()
+                    if not val:
+                        continue
+                    if found["code"] is None and "paint_code" in key.replace("-", "_"):
+                        if is_valid_code(val):
+                            found["code"] = val.upper()
+                    elif found["colour"] is None and key in ("colour", "color"):
+                        found["colour"] = val
+                    elif found["vehicle"] is None and key in ("vehicle_details", "vehicle"):
+                        found["vehicle"] = val
+                else:
+                    visit(v)
+        elif isinstance(node, list):
+            for item in node:
+                visit(item)
+
+    visit(payload)
+    return found if found["code"] else None
+
+
+def fresh_cookie_answer(value: Optional[str], baseline: Optional[str],
+                        reg: str) -> Optional[dict[str, str]]:
+    """A persistent profile keeps `paint_search_data` between runs, and the
+    widget restores it on load. Matching `reg_no` is not enough on a repeat of
+    the same reg, so the cookie must also have been rewritten since submit."""
+    if value is None or value == baseline:
+        return None
+    return cookie_answer(value, reg)
+
+
+def rows_answer(rows: list[list[str]]) -> Optional[dict[str, Optional[str]]]:
+    out: dict[str, Optional[str]] = {"code": None, "colour": None, "vehicle": None}
+    for label, value in rows:
+        key = (label or "").strip().rstrip(":").lower()
+        val = (value or "").strip()
+        if not val or val.upper() in PLACEHOLDERS:
+            continue
+        if key.startswith("paint code"):
+            out["code"] = val.upper() if is_valid_code(val) else None
+        elif key.startswith("colour") or key.startswith("color"):
+            out["colour"] = val
+        elif key.startswith("vehicle"):
+            out["vehicle"] = val
+    return out if out["code"] else None
+
+
+def codes_match(a: Optional[str], b: Optional[str]) -> bool:
+    """VAG codes come back without the L prefix: the site returns A7N where the
+    dealer gives LA7N, and Z9Y where Audi gives LZ9Y. Compare on the stem."""
+    def stem(x: Optional[str]) -> str:
+        if not x:
+            return ""
+        s = re.sub(r"[^A-Z0-9]", "", str(x).upper())
+        if len(s) > 3 and s.startswith("L") and s[1].isalpha():
+            s = s[1:]
+        return s
+    sa, sb = stem(a), stem(b)
+    return bool(sa) and sa == sb
+
+
+def consent_cookie() -> dict:
+    """Seeded so the consent banner never renders. Non essential categories are
+    declined; nothing is accepted by clicking."""
+    val = (f"consentid:{secrets.token_urlsafe(24)},consent:yes,action:yes,"
+           "necessary:yes,functional:no,analytics:no,performance:no,"
+           f"advertisement:no,other:no,lastRenewedDate:{int(time.time() * 1000)}")
+    return {"name": "cookieyes-consent", "value": val,
+            "domain": ".mymotorworld.com", "path": "/"}
+
+
+# ---------------------------------------------------------------------------
+# page javascript
+# ---------------------------------------------------------------------------
+
+# Knockout is an AMD module here, so it is not reliably on window. Try both.
+_KO = """
+  (window.ko) || (window.require ? (function () {
+      for (const name of ['ko', 'knockout', 'knockoutjs/knockout']) {
+          try { const m = window.require(name); if (m && m.dataFor) return m; }
+          catch (e) {}
+      }
+      return null;
+  })() : null)
+"""
+
+KO_READY_JS = f"""() => {{
+    const el = document.querySelector('{SEL_INPUT}');
+    if (!el) return {{ready: false, why: 'no input'}};
+    const ko = {_KO};
+    if (!ko) return {{ready: false, why: 'ko not loaded'}};
+    let vm = null;
+    try {{ vm = ko.dataFor(el); }} catch (e) {{ return {{ready: false, why: 'dataFor threw'}}; }}
+    if (!vm) return {{ready: false, why: 'bindings not applied'}};
+    return {{ready: true, has_reg: typeof vm.registrationNo === 'function',
+             has_submit: typeof vm.submitRegistration === 'function'}};
+}}"""
+
+SET_REG_JS = f"""(reg) => {{
+    const el = document.querySelector('{SEL_INPUT}');
+    if (!el) return {{ok: false, why: 'no input'}};
+    el.focus();
+    el.value = reg;
+    el.dispatchEvent(new Event('input', {{bubbles: true}}));
+    el.dispatchEvent(new Event('change', {{bubbles: true}}));
+    const ko = {_KO};
+    let observable = null;
+    if (ko) {{
+        try {{
+            const vm = ko.dataFor(el);
+            if (vm && ko.isObservable(vm.registrationNo)) {{
+                vm.registrationNo(reg);
+                observable = vm.registrationNo();
+            }}
+        }} catch (e) {{}}
+    }}
+    return {{ok: true, field: el.value, observable: observable}};
+}}"""
+
+CLEAR_COOKIE_JS = f"""() => {{
+    for (const d of ['', '; domain=.mymotorworld.com', '; domain=www.mymotorworld.com']) {{
+        document.cookie = '{COOKIE_NAME}=; Max-Age=0; path=/' + d;
+    }}
+    return document.cookie.includes('{COOKIE_NAME}');
+}}"""
+
+READ_ROWS_JS = f"""() => Array.from(
+    document.querySelectorAll('{SEL_RESULT} .info-row')
+).map(r => [
+    (r.querySelector('.label') || {{}}).textContent || '',
+    (r.querySelector('.value') || {{}}).getAttribute?.('title')
+        || (r.querySelector('.value') || {{}}).textContent || ''
+])"""
+
+
+# ---------------------------------------------------------------------------
+# browser
+# ---------------------------------------------------------------------------
+
+async def _cookie_value(ctx) -> Optional[str]:
+    for c in await ctx.cookies():
+        if c["name"] == COOKIE_NAME:
+            return c["value"]
+    return None
+
+
+async def _wait_for_ko(page, debug: bool = False) -> dict:
+    """The widget is inert until KO applies its bindings. Interacting before
+    that turns go into a native form submit that reloads the page."""
+    deadline = time.monotonic() + KO_DEADLINE_S
+    state: dict = {"ready": False, "why": "timeout"}
+    while time.monotonic() < deadline:
+        try:
+            state = await page.evaluate(KO_READY_JS)
+        except Exception as exc:
+            state = {"ready": False, "why": type(exc).__name__}
+        if state.get("ready"):
+            state["waited_s"] = round(KO_DEADLINE_S - (deadline - time.monotonic()), 2)
+            return state
+        await asyncio.sleep(0.25)
+    if debug:
+        print(f"  ko never ready: {state}")
+    return state
+
+
+async def _popup_text(page) -> Optional[str]:
+    try:
+        loc = page.locator(SEL_POPUP).first
+        if await loc.is_visible(timeout=250):
+            txt = (await loc.inner_text(timeout=800)).strip()
+            return " ".join(txt.split())[:200] or None
+    except Exception:
+        pass
+    return None
+
+
+async def _dismiss_popup(page) -> None:
+    for sel in SEL_POPUP_CLOSE:
+        try:
+            loc = page.locator(sel).first
+            if await loc.is_visible(timeout=300):
+                await loc.click()
+                return
+        except Exception:
+            continue
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
+async def _blocked(page) -> bool:
+    try:
+        body = (await page.inner_text("body", timeout=2000)).lower()[:2000]
+    except Exception:
+        return False
+    return any(m in body for m in CF_MARKERS)
+
+
+async def _submit(page) -> bool:
+    try:
+        go = page.locator(SEL_GO).first
+        if await go.is_visible(timeout=1500):
+            await go.click()
+            return True
+    except Exception:
+        pass
+    try:
+        await page.locator(SEL_INPUT).first.press("Enter")
+        return True
+    except Exception:
+        return False
+
+
+async def _reset(page) -> None:
+    try:
+        loc = page.locator(SEL_RESET).first
+        if await loc.is_visible(timeout=1500):
+            await loc.click()
+    except Exception:
+        pass
+    for _ in range(12):
+        try:
+            if await page.locator(SEL_HAS_VEHICLE).count() == 0:
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.25)
+    await page.goto(URL, wait_until="load")
+    await _wait_for_ko(page)
+
+
+async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
+    started = time.monotonic()
+    row: dict[str, Any] = {"reg": reg, "outcome": "error", "code": None,
+                           "colour": None, "vehicle": None, "source": None,
+                           "detail": None, "ms": 0}
+    try:
+        ko = await _wait_for_ko(page, debug)
+        if not ko.get("ready"):
+            row["detail"] = f"widget never initialised: {ko.get('why')}"
+            return row
+        if debug:
+            print(f"  ko ready after {ko.get('waited_s')}s {ko}")
+
+        # A restored result from a previous run must go before anything is
+        # submitted, or it can be read as this reg's answer.
+        try:
+            if await page.locator(SEL_HAS_VEHICLE).count():
+                if debug:
+                    print("  restored result on screen, resetting first")
+                await _reset(page)
+        except Exception:
+            pass
+
+        try:
+            still_there = await page.evaluate(CLEAR_COOKIE_JS)
+            if debug and still_there:
+                print("  cookie not removable from js, falling back to change detection")
+        except Exception:
+            pass
+        baseline_cookie = await _cookie_value(ctx)
+        try:
+            baseline_rows = await page.evaluate(READ_ROWS_JS)
+        except Exception:
+            baseline_rows = []
+
+        set_state = await page.evaluate(SET_REG_JS, reg)
+        if debug:
+            print(f"  after set: {set_state}")
+        if not set_state.get("ok"):
+            row["detail"] = f"could not set reg: {set_state.get('why')}"
+            return row
+        if set_state.get("observable") not in (None, reg) or set_state.get("field") != reg:
+            row["detail"] = (f"field/observable mismatch "
+                             f"{set_state.get('field')!r}/{set_state.get('observable')!r}")
+
+        trace["xhr"] = 0
+        trace["forbidden"] = 0
+        trace["navigated"] = False
+        trace["search"] = None
+        if not await _submit(page):
+            row["detail"] = "no submit control"
+            return row
+
+        deadline = time.monotonic() + DEADLINE_S
+        resubmitted = False
+        while time.monotonic() < deadline:
+            search = trace.get("search")
+            if search and search["status"] == 200:
+                try:
+                    ans = search_answer(json.loads(search["body"]))
+                except Exception:
+                    ans = None
+                if ans:
+                    row.update(ans, outcome="ok", source="endpoint")
+                    break
+
+            ans = fresh_cookie_answer(await _cookie_value(ctx), baseline_cookie, reg)
+            if ans:
+                row.update(ans, outcome="ok", source="cookie")
+                break
+
+            if trace["forbidden"]:
+                cf = trace.get("cf") or {}
+                row.update(outcome="blocked",
+                           detail=f"{trace['forbidden']} same origin 403 "
+                                  f"({cf.get('cf-mitigated') or cf.get('server') or 'edge'})")
+                break
+
+            try:
+                if await page.locator(SEL_HAS_VEHICLE).count():
+                    rows = await page.evaluate(READ_ROWS_JS)
+                    if rows and rows != baseline_rows:
+                        ans = rows_answer(rows)
+                        if ans:
+                            row.update(ans, outcome="ok", source="dom")
+                            break
+            except Exception:
+                pass
+
+            popup = await _popup_text(page)
+            if popup:
+                row.update(outcome="not_found", detail=popup, source="popup")
+                await _dismiss_popup(page)
+                break
+
+            if trace.get("navigated"):
+                # Native submit: KO was not bound, or it rebound mid click.
+                row.update(outcome="error", detail="page navigated after submit")
+                break
+
+            if await _blocked(page):
+                row.update(outcome="blocked", detail="challenge page")
+                break
+
+            if not resubmitted and (deadline - time.monotonic()) < (DEADLINE_S - RESUBMIT_AFTER_S):
+                resubmitted = True
+                if debug:
+                    print(f"  no answer after {RESUBMIT_AFTER_S}s, resubmitting "
+                          f"(xhr so far: {trace['xhr']})")
+                await page.evaluate(SET_REG_JS, reg)
+                await _submit(page)
+
+            await asyncio.sleep(POLL_S)
+        else:
+            row["outcome"] = "timeout"
+            row["detail"] = f"no answer, {trace['xhr']} same origin xhr after submit"
+
+    except Exception as exc:
+        row.update(outcome="error", detail=type(exc).__name__)
+    finally:
+        row["ms"] = int((time.monotonic() - started) * 1000)
+    return row
+
+
+async def _debug_report(page, ctx, trace: dict) -> None:
+    print("\n--- debug ---")
+    print(f"url now: {page.url}")
+    print(f"navigated after submit: {trace.get('navigated')}")
+    print(f"same origin xhr after submit: {trace['xhr']}, "
+          f"403s: {trace['forbidden']} {trace.get('cf') or ''}")
+    if trace.get("search"):
+        print(f"lookup endpoint: {trace['search']['status']} "
+              f"{trace['search']['body'][:400]}")
+    for c in trace["calls"][-15:]:
+        print(f"  {c['method']:4} {c['status']} {c['url'][:110]}")
+        if c.get("post"):
+            print(f"       post: {c['post'][:200]}")
+        if c.get("body"):
+            print(f"       body: {c['body'][:300]}")
+    if trace["console"]:
+        print("console errors:")
+        for m in trace["console"][:10]:
+            print(f"  {m[:200]}")
+    names = [c["name"] for c in await ctx.cookies()]
+    print(f"cookies: {sorted(names)}")
+    try:
+        html = await page.eval_on_selector(
+            "#paintMatchingVrmLookup", "e => e.outerHTML")
+        print("widget now:", re.sub(r"\s+", " ", html)[:1200])
+    except Exception as exc:
+        print(f"widget outerHTML unavailable: {exc}")
+    Path("debug_page.html").write_text(await page.content(), encoding="utf-8")
+    await page.screenshot(path="debug_page.png", full_page=False)
+    print("wrote debug_page.html and debug_page.png")
+
+
+async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
+              profile: Optional[str], chromium_only: bool,
+              block_assets: bool) -> list[dict]:
+    from playwright.async_api import async_playwright
+
+    rows: list[dict] = []
+    trace: dict = {"xhr": 0, "forbidden": 0, "navigated": False,
+                   "calls": [], "console": [], "cf": {}, "search": None}
+
+    async with async_playwright() as p:
+        # --enable-automation and navigator.webdriver are read by bot
+        # management. Real Chrome is preferred over bundled Chromium for the
+        # same reason; fall back if it is not installed.
+        launch: dict = {
+            "headless": not headed,
+            "args": ["--disable-dev-shm-usage",
+                     "--disable-blink-features=AutomationControlled"],
+            "ignore_default_args": ["--enable-automation"],
+        }
+        if not chromium_only:
+            launch["channel"] = "chrome"
+        if profile:
+            try:
+                ctx = await p.chromium.launch_persistent_context(
+                    profile, locale="en-GB", timezone_id="Europe/London",
+                    viewport={"width": 1400, "height": 1000}, **launch)
+            except Exception:
+                launch.pop("channel", None)
+                print("real Chrome not available, falling back to bundled chromium")
+                ctx = await p.chromium.launch_persistent_context(
+                    profile, locale="en-GB", timezone_id="Europe/London",
+                    viewport={"width": 1400, "height": 1000}, **launch)
+            browser = None
+        else:
+            try:
+                browser = await p.chromium.launch(**launch)
+            except Exception:
+                launch.pop("channel", None)
+                print("real Chrome not available, falling back to bundled chromium")
+                browser = await p.chromium.launch(**launch)
+            ctx = await browser.new_context(locale="en-GB", timezone_id="Europe/London",
+                                            viewport={"width": 1400, "height": 1000})
+
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        await ctx.add_cookies([consent_cookie()])
+
+        # Interception rewrites every request, which is itself a signal. Off by
+        # default now; --block turns the tracker filtering back on.
+        if block_assets:
+            async def block(route, request):
+                if request.resource_type in ("image", "media", "font"):
+                    await route.abort()
+                elif any(f in request.url for f in BLOCK_FRAGMENTS):
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await ctx.route("**/*", block)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        pending: list[asyncio.Task] = []
+
+        async def on_response(resp):
+            req = resp.request
+            if ORIGIN not in req.url:
+                return
+            if resp.status == 403:
+                trace["forbidden"] += 1
+                if not trace.get("cf"):
+                    h = resp.headers
+                    trace["cf"] = {k: h.get(k) for k in
+                                   ("cf-mitigated", "cf-ray", "server")
+                                   if h.get(k)}
+            if req.resource_type not in ("xhr", "fetch"):
+                return
+            trace["xhr"] += 1
+
+            text = None
+            try:
+                text = await resp.text()
+            except Exception:
+                pass
+
+            if LOOKUP_PATH in req.url:
+                trace["search"] = {"status": resp.status, "body": (text or "")[:4000]}
+
+            if not debug:
+                return
+            body = text[:1500] if text and text.strip()[:1] in "{[" else None
+            trace["calls"].append({"method": req.method, "url": req.url,
+                                   "status": resp.status, "post": req.post_data,
+                                   "body": body})
+
+        page.on("response", lambda r: pending.append(asyncio.create_task(on_response(r))))
+        page.on("framenavigated", lambda f: trace.__setitem__("navigated", True)
+                if f == page.main_frame else None)
+        page.on("console", lambda m: trace["console"].append(f"{m.type}: {m.text}")
+                if m.type in ("error", "warning") else None)
+
+        await page.goto(URL, wait_until="load", timeout=60000)
+        trace["navigated"] = False
+
+        if await _blocked(page):
+            print("challenge page on load. Run once with --headed --profile .profile, "
+                  "clear it by hand, then rerun; the clearance persists.")
+            await (browser.close() if browser else ctx.close())
+            return rows
+
+        try:
+            if await page.locator(SEL_HAS_VEHICLE).count():
+                await _reset(page)
+        except Exception:
+            pass
+
+        for n, reg in enumerate(regs, 1):
+            row = await lookup_one(page, ctx, reg, debug, trace)
+            rows.append(row)
+            print(f"[{n}/{len(regs)}] {reg:<8} {row['outcome']:<10} "
+                  f"{row['code'] or '':<8} {row['ms']:>5}ms  "
+                  f"{row['vehicle'] or row['detail'] or ''}")
+            if out:
+                _append_csv(out, row)
+            if debug:
+                await _debug_report(page, ctx, trace)
+            if row["outcome"] == "blocked":
+                print("stopping: challenged mid run")
+                break
+            if n < len(regs):
+                await _reset(page)
+                if n % RELOAD_EVERY == 0:
+                    await page.goto(URL, wait_until="load")
+                    await _wait_for_ko(page)
+                await asyncio.sleep(random.uniform(*DELAY_S))
+
+        await asyncio.gather(*pending, return_exceptions=True)
+        if browser:
+            await browser.close()
+        else:
+            await ctx.close()
+    return rows
+
+
+FIELDS = ["reg", "outcome", "code", "colour", "vehicle", "source", "detail", "ms"]
+
+
+def _append_csv(path: Path, row: dict) -> None:
+    new = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow({k: row.get(k) for k in FIELDS})
+
+
+def _done_regs(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    with path.open(newline="", encoding="utf-8") as fh:
+        return {r["reg"] for r in csv.DictReader(fh) if r.get("reg")}
+
+
+def _load_expected(path: Path) -> dict[str, str]:
+    with path.open(newline="", encoding="utf-8") as fh:
+        return {normalise_reg(r.get("reg")): (r.get("code") or "").strip().upper()
+                for r in csv.DictReader(fh) if r.get("reg")}
+
+
+def _report(rows: list[dict], expected: dict[str, str]) -> None:
+    agree = disagree = missing = 0
+    print("\nreg       expected   returned   verdict")
+    for r in rows:
+        exp = expected.get(r["reg"])
+        if not exp:
+            continue
+        got = r["code"]
+        if not got:
+            missing += 1
+            verdict = f"no answer ({r['outcome']})"
+        elif codes_match(exp, got):
+            agree += 1
+            verdict = "match" if exp == got else "match (prefix differs)"
+        else:
+            disagree += 1
+            verdict = "MISMATCH"
+        print(f"{r['reg']:<9} {exp:<10} {got or '':<10} {verdict}")
+    print(f"\n{agree} agree, {disagree} disagree, {missing} no answer")
+    if disagree:
+        print("a single disagreement against a dealer confirmed code means this "
+              "is a cross check, not a code source")
+
+
+def selftest() -> int:
+    fails: list[str] = []
+
+    def check(label, cond):
+        if not cond:
+            fails.append(label)
+            print(f"FAIL  {label}")
+
+    for good in ("LA7N", "A7N", "Z9Y", "OVDQH", "OV369", "OVKQM", "Z1/A7N"):
+        check(f"accepts {good}", is_valid_code(good))
+    for bad in ("", None, "-", "ENTER REG", "enter reg", "a",
+                "Please enter your registration number"):
+        check(f"rejects {bad!r}", not is_valid_code(bad))
+
+    live = ("%7B%22vehicle_details%22%3A%22Audi%20A3%202009%202.0%20Diesel%22%2C"
+            "%22colour%22%3A%22BLACK%22%2C%22paint_code%22%3A%22Z9Y%22%2C"
+            "%22reg_no%22%3A%22wp09uou%22%7D")
+    check("live cookie parses", cookie_answer(live, "WP09UOU") ==
+          {"code": "Z9Y", "colour": "BLACK", "vehicle": "Audi A3 2009 2.0 Diesel"})
+    check("cookie tolerates spaced reg", cookie_answer(live, "wp09 uou") is not None)
+    check("cookie for another reg is refused", cookie_answer(live, "GM14DKE") is None)
+    check("empty cookie is refused", cookie_answer(None, "WP09UOU") is None)
+    check("garbage cookie is refused", cookie_answer("%7Bnot json", "WP09UOU") is None)
+    check("cookie with placeholder code refused",
+          cookie_answer(urllib.parse.quote(json.dumps(
+              {"paint_code": "ENTER REG", "reg_no": "AB12CDE"})), "AB12CDE") is None)
+
+    check("live dom rows parse", rows_answer(
+        [["Vehicle:", "Volkswagen Golf 2014 1.6 Diesel"],
+         ["Colour:", "GREY"], ["Paint Code:", "A7N"]]) ==
+        {"code": "A7N", "colour": "GREY", "vehicle": "Volkswagen Golf 2014 1.6 Diesel"})
+    check("dom rows without a code yield nothing",
+          rows_answer([["Vehicle:", "VW Golf"], ["Colour:", "GREY"]]) is None)
+    check("dom placeholder yields nothing", rows_answer([["Paint Code:", "ENTER REG"]]) is None)
+
+    check("stale cookie identical to baseline is refused",
+          fresh_cookie_answer(live, live, "WP09UOU") is None)
+    check("rewritten cookie is accepted",
+          fresh_cookie_answer(live, "something-older", "WP09UOU") is not None)
+    check("no cookie is refused", fresh_cookie_answer(None, None, "WP09UOU") is None)
+    check("fresh cookie for the wrong reg is still refused",
+          fresh_cookie_answer(live, None, "GM14DKE") is None)
+
+    check("endpoint payload parses", search_answer(
+        {"paint_search_data": {"vehicle_details": "Volkswagen Golf 2014 1.6 Diesel",
+                               "colour": "GREY", "paint_code": "A7N"}}) ==
+        {"code": "A7N", "colour": "GREY", "vehicle": "Volkswagen Golf 2014 1.6 Diesel"})
+    check("endpoint failure payload yields nothing",
+          search_answer({"success": False, "message": "No vehicle found"}) is None)
+    check("endpoint placeholder yields nothing",
+          search_answer({"paint_code": "ENTER REG"}) is None)
+    check("endpoint list payload", search_answer(
+        [{"data": [{"paint_code": "OVDQH"}]}])["code"] == "OVDQH")
+
+    check("VAG prefix match LA7N/A7N", codes_match("LA7N", "A7N"))
+    check("VAG prefix match LZ9Y/Z9Y", codes_match("LZ9Y", "Z9Y"))
+    check("exact still matches", codes_match("OVDQH", "OVDQH"))
+    check("separators ignored", codes_match("Z1/A7N", "Z1 A7N"))
+    check("different codes do not match", not codes_match("LA7N", "LB9A"))
+    check("empty never matches", not codes_match(None, "A7N"))
+    check("short L code is not stripped", not codes_match("LB9", "B9"))
+
+    check("reg normalise", normalise_reg(" ab-12 cde ") == "AB12CDE")
+    check("reg normalise empty", normalise_reg(None) == "")
+
+    # the js is built by f-string, so a broken selector constant shows up here
+    for js in (KO_READY_JS, SET_REG_JS, READ_ROWS_JS):
+        check("js has no unresolved braces", "{{" not in js and "}}" not in js)
+    check("ko probe references the input", SEL_INPUT in KO_READY_JS)
+
+    print()
+    if fails:
+        print(f"{len(fails)} FAILURES")
+        return 1
+    print("selftest green")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="reg to paint code")
+    ap.add_argument("regs", nargs="*")
+    ap.add_argument("--file", help="text file, one reg per line")
+    ap.add_argument("--out", default="results.csv")
+    ap.add_argument("--expect", help="csv with reg,code columns for an accuracy run")
+    ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--profile", help="persistent chrome profile dir, keeps clearance")
+    ap.add_argument("--debug", action="store_true", help="full diagnostic report")
+    ap.add_argument("--chromium", action="store_true",
+                    help="use bundled chromium instead of installed Chrome")
+    ap.add_argument("--block", action="store_true",
+                    help="intercept and block trackers, faster but more detectable")
+    ap.add_argument("--no-resume", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args()
+
+    if a.selftest:
+        return selftest()
+
+    expected: dict[str, str] = {}
+    regs = [normalise_reg(r) for r in a.regs]
+    if a.expect:
+        expected = _load_expected(Path(a.expect))
+        regs += list(expected)
+    if a.file:
+        regs += [normalise_reg(ln) for ln in
+                 Path(a.file).read_text(encoding="utf-8").splitlines()]
+    regs = [r for r in dict.fromkeys(regs) if 2 <= len(r) <= 8]
+    if not regs:
+        ap.print_help()
+        return 2
+
+    out = Path(a.out) if (a.file or a.expect or len(regs) > 1) else None
+    if out and not a.no_resume:
+        done = _done_regs(out)
+        if any(r in done for r in regs):
+            print(f"skipping {sum(1 for r in regs if r in done)} already in {out}")
+        regs = [r for r in regs if r not in done]
+    if not regs:
+        print("nothing to do")
+        return 0
+
+    rows = asyncio.run(run(regs, a.headed, out, a.debug, a.profile,
+                           a.chromium, a.block))
+    if expected:
+        _report(rows, expected)
+    elif len(rows) == 1 and not out:
+        print(json.dumps(rows[0], indent=2))
+    else:
+        ok = sum(1 for r in rows if r["outcome"] == "ok")
+        print(f"\n{ok}/{len(rows)} ok  ->  {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

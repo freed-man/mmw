@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# holds cf_clearance and the live session cookies
+.profile/
+
+# debug artefacts and results carry real registrations
+debug_page.html
+debug_page.png
+*.csv
+*.png
