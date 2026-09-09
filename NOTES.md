@@ -10,6 +10,46 @@ python mmw.py --selftest
 python mmw.py GM14DKE --headed
 ```
 
+## Speed
+
+By default each lookup calls the widget's own endpoint from inside the page:
+
+```
+POST /paintmatching/colour/search
+data[registration]=<REG>&data[form_key]=<key>&form_key=<key>
+```
+
+Same origin, same cookies, same session as the form submit it replaces, so it
+is the same request the site would have made. That skips the overlays, the
+Knockout wait, the reset and the polling: one round trip instead of a UI dance.
+`--slow` drives the form instead, and the form path is also the automatic
+fallback whenever the endpoint gives nothing usable.
+
+Two other costs went with it. A full `body` text scrape ran four times a second
+to check for a challenge page, on a large Magento DOM; it now runs once, after
+the wait fails. The popup probe carried a 250ms timeout on every poll; it now
+runs every sixth.
+
+The page itself is also skipped. Magento generates `form_key` in JavaScript,
+in `form-key-provider.js`, sixteen random alphanumerics; the widget then posts
+that same value in both `form_key` and `data[form_key]`. The server validates
+by comparing the two rather than against the session, so the cookie can simply
+be written here and the retail page never has to load at all. What loads
+instead is `/customer/section/load/?sections=paint-data`, a few hundred bytes
+on the same origin, purely to host the fetch call.
+
+If a seeded key is ever refused, the first lookup detects it, takes one real
+session from the page, and the run continues at full speed. A 403 on an
+invented key means a rejected key, not a blocked client, and is not reported as
+one.
+
+Measured on one reg, cold, headless: 10.4s before this, 3.4s after, of which
+0.7s is Chrome booting and 0.7s is the site answering. Neither is ours.
+
+What remains is the throttle between regs, which is deliberate rather than
+accidental: `--delay 1` will halve it, and the default stays at two to four
+seconds.
+
 ## How it reads the answer
 
 The site writes its own result to a plain cookie on every successful lookup:

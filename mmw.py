@@ -33,6 +33,7 @@ import json
 import random
 import re
 import secrets
+import string
 import time
 import urllib.parse
 from pathlib import Path
@@ -48,11 +49,18 @@ COOKIE_NAME = "paint_search_data"
 # more certain than waiting for the cookie to be rewritten.
 LOOKUP_PATH = "/paintmatching/colour/search"
 
+# The fetch path needs a document on the origin and the form_key cookie, not a
+# retail homepage with Maps, New Relic and a chat widget attached. This is the
+# site's own section endpoint: same origin, same session, a few hundred bytes.
+LIGHT_URL = ("https://www.mymotorworld.com/customer/section/load/"
+             "?sections=paint-data")
+
 DEADLINE_S = 25.0
 KO_DEADLINE_S = 25.0
-POLL_S = 0.25
+POLL_S = 0.12
+POPUP_EVERY = 6          # poll iterations between popup probes
 RESUBMIT_AFTER_S = 8.0
-DELAY_S = (2.0, 4.0)
+DELAY_S = (2.0, 4.0)      # overridable with --delay
 RELOAD_EVERY = 40
 
 SEL_INPUT = "#paint-vrm-reg"
@@ -94,7 +102,8 @@ BLOCK_FRAGMENTS = (
 )
 
 CF_MARKERS = ("just a moment", "attention required", "cf-challenge",
-              "checking your browser", "verify you are human")
+              "checking your browser", "verify you are human",
+              "you have been blocked", "access denied", "enable javascript and cookies")
 
 PLACEHOLDERS = {"ENTER REG", "ENTER YOUR REG", "N/A", "TBC", "UNKNOWN", "-", ""}
 CODE_SHAPE = re.compile(r"^[A-Z0-9][A-Z0-9 ./\-]{0,19}$")
@@ -227,6 +236,20 @@ def codes_match(a: Optional[str], b: Optional[str]) -> bool:
     return bool(sa) and sa == sb
 
 
+def make_form_key() -> str:
+    """Magento generates this client side in form-key-provider.js, 16 random
+    alphanumerics, and the widget then posts the same value in both form_key
+    and data[form_key]. Writing it ourselves saves waiting for their bundle to
+    boot purely to watch it call Math.random."""
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(16))
+
+
+def form_key_cookie(value: str) -> dict:
+    return {"name": "form_key", "value": value,
+            "domain": ".mymotorworld.com", "path": "/"}
+
+
 def consent_cookie() -> dict:
     """Seeded so the consent banner never renders. Non essential categories are
     declined; nothing is accepted by clicking."""
@@ -292,6 +315,35 @@ CLEAR_COOKIE_JS = f"""() => {{
     return document.cookie.includes('{COOKIE_NAME}');
 }}"""
 
+# The widget POSTs this. Calling it from the page costs one round trip and
+# skips the whole UI dance: no overlays, no Knockout, no reset, no polling.
+# Same origin, same cookies, same session as the form submit it replaces.
+FETCH_JS = """async (reg) => {
+    // No regex here on purpose: this string passes through python escaping
+    // before it is javascript, and \\s does not survive that intact.
+    const hit = document.cookie.split(';')
+        .map(c => c.trim())
+        .find(c => c.startsWith('form_key='));
+    if (!hit) return {ok: false, why: 'no form_key cookie'};
+    const key = decodeURIComponent(hit.slice('form_key='.length));
+    const body = new URLSearchParams();
+    body.set('data[registration]', reg);
+    body.set('data[form_key]', key);
+    body.set('form_key', key);
+    try {
+        const r = await fetch('%s', {
+            method: 'POST',
+            headers: {'X-Requested-With': 'XMLHttpRequest',
+                      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+            body: body.toString(),
+            credentials: 'same-origin',
+        });
+        return {ok: true, status: r.status, text: (await r.text()).slice(0, 4000)};
+    } catch (e) {
+        return {ok: false, why: String(e)};
+    }
+}""" % LOOKUP_PATH
+
 READ_ROWS_JS = f"""() => Array.from(
     document.querySelectorAll('{SEL_RESULT} .info-row')
 ).map(r => [
@@ -310,6 +362,20 @@ async def _cookie_value(ctx) -> Optional[str]:
         if c["name"] == COOKIE_NAME:
             return c["value"]
     return None
+
+
+async def _wait_for_form_key(ctx, timeout_s: float = 15.0) -> bool:
+    """The fetch path needs exactly two things: a document on the origin so the
+    call is same origin, and the form_key cookie. Not the images, not the fonts,
+    not Google Maps, not Knockout. Waiting for `load` on a retail page costs
+    fifteen seconds to obtain something the first response header already gave."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        for c in await ctx.cookies():
+            if c["name"] == "form_key" and c["value"]:
+                return True
+        await asyncio.sleep(0.1)
+    return False
 
 
 async def _wait_for_ko(page, debug: bool = False) -> dict:
@@ -377,6 +443,21 @@ async def _dismiss_popup(page) -> None:
         pass
 
 
+async def _page_summary(page) -> dict:
+    """Used when the widget is missing. "no input" says the element was not
+    there; this says what was there instead, which is the useful half."""
+    out = {"title": "", "body": "", "url": page.url}
+    try:
+        out["title"] = await page.title()
+    except Exception:
+        pass
+    try:
+        out["body"] = " ".join((await page.inner_text("body", timeout=3000)).split())[:200]
+    except Exception:
+        pass
+    return out
+
+
 async def _blocked(page) -> bool:
     try:
         body = (await page.inner_text("body", timeout=2000)).lower()[:2000]
@@ -418,15 +499,87 @@ async def _reset(page) -> None:
     await _wait_for_ko(page)
 
 
-async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
+async def _lookup_via_fetch(page, ctx, reg: str, before: Optional[str],
+                            debug: bool, seeded: bool = False) -> Optional[dict]:
+    """Returns a row update, or None to fall back to driving the form."""
+    try:
+        res = await page.evaluate(FETCH_JS, reg)
+    except Exception as exc:
+        if debug:
+            print(f"  fetch path threw: {type(exc).__name__}")
+        return None
+    if debug:
+        print(f"  fetch: {str(res)[:220]}")
+    if not res.get("ok"):
+        return None
+    if res.get("status") != 200:
+        if res.get("status") == 403 and not seeded:
+            return {"outcome": "blocked", "source": "fetch",
+                    "detail": "endpoint returned 403"}
+        return None  # seeded key refused, or anything else: fall back
+
+    text = res.get("text") or ""
+    ans = None
+    try:
+        ans = search_answer(json.loads(text))
+    except Exception:
+        pass
+    if not ans:
+        # The endpoint sets the cookie on its response, so read that instead.
+        ans = fresh_cookie_answer(await _cookie_value(ctx), before, reg)
+    if ans:
+        return {**ans, "outcome": "ok", "source": "fetch"}
+    if is_not_found_text(text):
+        return {"outcome": "not_found", "source": "fetch",
+                "detail": " ".join(text.split())[:200]}
+    return None
+
+
+async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict,
+                     slow: bool = False) -> dict:
     started = time.monotonic()
     row: dict[str, Any] = {"reg": reg, "outcome": "error", "code": None,
                            "colour": None, "vehicle": None, "source": None,
                            "detail": None, "ms": 0}
     try:
+        if not slow:
+            before = await _cookie_value(ctx)
+            try:
+                await page.evaluate(CLEAR_COOKIE_JS)
+            except Exception:
+                pass
+            seeded = trace.get("seeded", False)
+            fast = await _lookup_via_fetch(page, ctx, reg, before, debug, seeded)
+            if fast:
+                row.update(fast)
+                return row
+
+            if seeded and not trace.get("recovered"):
+                # The invented key was refused. Get a real one from the page
+                # once, then this run carries on at full speed.
+                if debug:
+                    print("  seeded key refused, taking a real session once")
+                trace["recovered"] = True
+                trace["seeded"] = False
+                await page.goto(URL, wait_until="commit", timeout=60000)
+                await _wait_for_form_key(ctx, 15.0)
+                before = await _cookie_value(ctx)
+                fast = await _lookup_via_fetch(page, ctx, reg, before, debug)
+                if fast:
+                    row.update(fast)
+                    return row
+
+            if debug:
+                print("  fast path gave nothing, loading the page for the form")
+            await page.goto(URL, wait_until="load", timeout=60000)
+
         ko = await _wait_for_ko(page, debug)
         if not ko.get("ready"):
-            row["detail"] = f"widget never initialised: {ko.get('why')}"
+            info = await _page_summary(page)
+            row["outcome"] = "blocked" if await _blocked(page) else "error"
+            row["detail"] = (f"widget never initialised: {ko.get('why')}; "
+                             f"403s={trace['forbidden']}; title={info['title']!r}; "
+                             f"body={info['body'][:120]!r}")
             return row
         if debug:
             print(f"  ko ready after {ko.get('waited_s')}s {ko}")
@@ -475,6 +628,7 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
 
         deadline = time.monotonic() + DEADLINE_S
         resubmitted = False
+        spins = 0
         while time.monotonic() < deadline:
             search = trace.get("search")
             if search and search["status"] == 200:
@@ -509,7 +663,8 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
             except Exception:
                 pass
 
-            popup = await _popup_text(page)
+            spins += 1
+            popup = await _popup_text(page) if spins % POPUP_EVERY == 0 else None
             if popup:
                 if is_not_found_text(popup):
                     row.update(outcome="not_found", detail=popup, source="popup")
@@ -525,10 +680,6 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
                 row.update(outcome="error", detail="page navigated after submit")
                 break
 
-            if await _blocked(page):
-                row.update(outcome="blocked", detail="challenge page")
-                break
-
             if not resubmitted and (deadline - time.monotonic()) < (DEADLINE_S - RESUBMIT_AFTER_S):
                 resubmitted = True
                 if debug:
@@ -539,8 +690,12 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict) -> dict:
 
             await asyncio.sleep(POLL_S)
         else:
-            row["outcome"] = "timeout"
-            row["detail"] = f"no answer, {trace['xhr']} same origin xhr after submit"
+            if await _blocked(page):
+                row.update(outcome="blocked", detail="challenge page")
+            else:
+                row["outcome"] = "timeout"
+                row["detail"] = (f"no answer, {trace['xhr']} same origin xhr "
+                                 f"after submit")
 
     except Exception as exc:
         row.update(outcome="error", detail=type(exc).__name__)
@@ -583,10 +738,14 @@ async def _debug_report(page, ctx, trace: dict) -> None:
 
 async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
               profile: Optional[str], chromium_only: bool,
-              block_assets: bool) -> list[dict]:
+              block_assets: bool, offscreen: bool, slow: bool,
+              delay: Optional[float]) -> list[dict]:
     from playwright.async_api import async_playwright
 
     rows: list[dict] = []
+    timings: dict = {"launch": 0.0, "page": 0.0, "driver": 0.0, "close": 0.0,
+                     "via": "full page"}
+    started_all = time.monotonic()
     trace: dict = {"xhr": 0, "forbidden": 0, "navigated": False,
                    "calls": [], "console": [], "cf": {}, "search": None}
 
@@ -594,10 +753,16 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
         # --enable-automation and navigator.webdriver are read by bot
         # management. Real Chrome is preferred over bundled Chromium for the
         # same reason; fall back if it is not installed.
+        t_launch = time.monotonic()
+        args = ["--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled"]
+        if offscreen:
+            # A genuine headed browser parked off the visible desktop. Nothing
+            # to fingerprint, because nothing about it is headless.
+            args.append("--window-position=-32000,-32000")
         launch: dict = {
-            "headless": not headed,
-            "args": ["--disable-dev-shm-usage",
-                     "--disable-blink-features=AutomationControlled"],
+            "headless": False if offscreen else not headed,
+            "args": args,
             "ignore_default_args": ["--enable-automation"],
         }
         if not chromium_only:
@@ -621,9 +786,24 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                 launch.pop("channel", None)
                 print("real Chrome not available, falling back to bundled chromium")
                 browser = await p.chromium.launch(**launch)
-            ctx = await browser.new_context(locale="en-GB", timezone_id="Europe/London",
-                                            viewport={"width": 1400, "height": 1000})
+            opts = {"locale": "en-GB", "timezone_id": "Europe/London",
+                    "viewport": {"width": 1400, "height": 1000}}
+            ctx = await browser.new_context(**opts)
+            if launch["headless"]:
+                # Headless Chrome puts "HeadlessChrome" in the UA of every
+                # request. Read the real one and rebuild the context without it,
+                # rather than hardcoding a version that will drift.
+                scratch = await ctx.new_page()
+                ua = await scratch.evaluate("navigator.userAgent")
+                await scratch.close()
+                if "Headless" in ua:
+                    await ctx.close()
+                    ctx = await browser.new_context(
+                        user_agent=ua.replace("HeadlessChrome", "Chrome"), **opts)
+                    if debug:
+                        print(f"  ua cleaned: {ua.replace('HeadlessChrome', 'Chrome')}")
 
+        timings["launch"] = time.monotonic() - t_launch
         await ctx.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
         await ctx.add_cookies([consent_cookie()])
@@ -686,23 +866,53 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
         page.on("console", lambda m: trace["console"].append(f"{m.type}: {m.text}")
                 if m.type in ("error", "warning") else None)
 
-        await page.goto(URL, wait_until="load", timeout=60000)
+        t_page = time.monotonic()
+        if slow:
+            await page.goto(URL, wait_until="load", timeout=60000)
+        else:
+            timings["via"] = "seeded"
+            if not await _wait_for_form_key(ctx, 0.05):
+                await ctx.add_cookies([form_key_cookie(make_form_key())])
+            try:
+                await page.goto(LIGHT_URL, wait_until="commit", timeout=20000)
+            except Exception:
+                pass
+            got_key = await _wait_for_form_key(ctx, 2.0)
+            if not got_key:
+                # The light document did not establish a session; pay for the
+                # real page once.
+                timings["via"] = "full page"
+                await page.goto(URL, wait_until="commit", timeout=60000)
+                got_key = await _wait_for_form_key(ctx, 15.0)
+            try:
+                # Abandon whatever is still downloading. Bounded, because this
+                # can block until an execution context exists.
+                await asyncio.wait_for(page.evaluate("window.stop()"), 2.0)
+            except Exception:
+                pass
+            trace["seeded"] = timings["via"] == "seeded"
+            if not got_key:
+                print("no form_key cookie, falling back to the form path")
+                slow = True
+                await page.goto(URL, wait_until="load", timeout=60000)
+        timings["page"] = time.monotonic() - t_page
         trace["navigated"] = False
 
-        if await _blocked(page):
+        if slow and await _blocked(page):
             print("challenge page on load. Run once with --headed --profile .profile, "
                   "clear it by hand, then rerun; the clearance persists.")
             await (browser.close() if browser else ctx.close())
             return rows
 
-        try:
-            if await page.locator(SEL_HAS_VEHICLE).count():
-                await _reset(page)
-        except Exception:
-            pass
+        if slow:
+            try:
+                if await page.locator(SEL_HAS_VEHICLE).count():
+                    await _reset(page)
+            except Exception:
+                pass
 
         for n, reg in enumerate(regs, 1):
-            row = await lookup_one(page, ctx, reg, debug, trace)
+            row = await lookup_one(page, ctx, reg, debug, trace, slow)
             rows.append(row)
             print(f"[{n}/{len(regs)}] {reg:<8} {row['outcome']:<10} "
                   f"{row['code'] or '':<8} {row['ms']:>5}ms  "
@@ -715,13 +925,24 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                 print("stopping: challenged mid run")
                 break
             if n < len(regs):
-                await _reset(page)
-                if n % RELOAD_EVERY == 0:
+                if row.get("source") != "fetch":
+                    await _reset(page)
+                if slow and n % RELOAD_EVERY == 0:
                     await page.goto(URL, wait_until="load")
                     await _wait_for_ko(page)
-                await asyncio.sleep(random.uniform(*DELAY_S))
+                lo, hi = DELAY_S if delay is None else (delay * 0.75, delay * 1.25)
+                await asyncio.sleep(random.uniform(lo, hi))
 
+        t_close = time.monotonic()
         await asyncio.gather(*pending, return_exceptions=True)
+        timings["close"] = time.monotonic() - t_close
+        lookups = sum(r["ms"] for r in rows) / 1000
+        total = time.monotonic() - started_all
+        print(f"\ntiming: driver {timings['driver']:.1f}s, browser "
+              f"{timings['launch']:.1f}s, first page {timings['page']:.1f}s "
+              f"via {timings['via']}, lookups {lookups:.1f}s "
+              f"({lookups / max(len(rows), 1):.1f}s each), drain "
+              f"{timings['close']:.1f}s, total {total:.1f}s")
         if browser:
             await browser.close()
         else:
@@ -886,7 +1107,19 @@ def selftest() -> int:
     check("reg normalise empty", normalise_reg(None) == "")
 
     # the js is built by f-string, so a broken selector constant shows up here
-    for js in (KO_READY_JS, SET_REG_JS, READ_ROWS_JS):
+    keys = {make_form_key() for _ in range(200)}
+    check("form key is 16 chars", all(len(k) == 16 for k in keys))
+    check("form key is alphanumeric", all(k.isalnum() for k in keys))
+    check("form key is not repeated", len(keys) == 200)
+    check("form key cookie is scoped to the site",
+          form_key_cookie("x")["domain"] == ".mymotorworld.com")
+
+    check("fetch js targets the endpoint", LOOKUP_PATH in FETCH_JS)
+    check("fetch js sends both form key fields",
+          "data[form_key]" in FETCH_JS and "form_key" in FETCH_JS)
+    check("fetch js keeps the session", "same-origin" in FETCH_JS)
+
+    for js in (KO_READY_JS, SET_REG_JS, READ_ROWS_JS, FETCH_JS):
         check("js has no unresolved braces", "{{" not in js and "}}" not in js)
     check("ko probe references the input", SEL_INPUT in KO_READY_JS)
 
@@ -928,6 +1161,13 @@ def main() -> int:
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--profile", help="persistent chrome profile dir, keeps clearance")
     ap.add_argument("--debug", action="store_true", help="full diagnostic report")
+    ap.add_argument("--slow", action="store_true",
+                    help="drive the form instead of calling the endpoint directly")
+    ap.add_argument("--delay", type=float, default=None,
+                    help="mean seconds between lookups (default 3, jittered)")
+    ap.add_argument("--offscreen", action="store_true",
+                    help="real headed browser positioned off the desktop, "
+                         "invisible without being headless")
     ap.add_argument("--chromium", action="store_true",
                     help="use bundled chromium instead of installed Chrome")
     ap.add_argument("--block", action="store_true",
@@ -980,14 +1220,14 @@ def main() -> int:
         return 0
 
     rows = asyncio.run(run(regs, a.headed, out, a.debug, a.profile,
-                           a.chromium, a.block))
+                           a.chromium, a.block, a.offscreen, a.slow, a.delay))
     if expected:
         _report(rows, expected)
     elif len(rows) == 1 and not out:
         print(json.dumps(rows[0], indent=2))
     else:
         ok = sum(1 for r in rows if r["outcome"] == "ok")
-        print(f"\n{ok}/{len(rows)} ok  ->  {out}")
+        print(f"{ok}/{len(rows)} ok  ->  {out}")
     return 0
 
 
