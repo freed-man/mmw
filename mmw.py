@@ -679,17 +679,46 @@ def _append_csv(path: Path, row: dict) -> None:
         w.writerow({k: row.get(k) for k in FIELDS})
 
 
+# utf-8-sig everywhere: PowerShell writes a BOM with -Encoding utf8, which
+# turns the first column name into "\ufeffreg" and silently drops every row.
 def _done_regs(path: Path) -> set[str]:
     if not path.exists():
         return set()
-    with path.open(newline="", encoding="utf-8") as fh:
+    with path.open(newline="", encoding="utf-8-sig") as fh:
         return {r["reg"] for r in csv.DictReader(fh) if r.get("reg")}
 
 
+REG_HEADERS = {"reg", "registration", "reg_no", "regno", "vrm", "plate"}
+CODE_HEADERS = {"code", "paint_code", "paintcode", "expected", "expected_code"}
+
+
 def _load_expected(path: Path) -> dict[str, str]:
-    with path.open(newline="", encoding="utf-8") as fh:
-        return {normalise_reg(r.get("reg")): (r.get("code") or "").strip().upper()
-                for r in csv.DictReader(fh) if r.get("reg")}
+    """Deliberately forgiving about shape: a header line is optional, the
+    column names have several accepted spellings, and extra columns are fine.
+    Getting this wrong costs a confusing empty run, not a wrong answer."""
+    rows = [r for r in csv.reader(path.read_text(encoding="utf-8-sig").splitlines())
+            if any((c or "").strip() for c in r)]
+    if not rows:
+        return {}
+
+    head = [(c or "").strip().lower() for c in rows[0]]
+    if any(h in REG_HEADERS for h in head):
+        reg_i = next(n for n, h in enumerate(head) if h in REG_HEADERS)
+        code_i = next((n for n, h in enumerate(head) if h in CODE_HEADERS),
+                      1 if len(head) > 1 else 0)
+        body = rows[1:]
+    else:
+        reg_i, code_i, body = 0, 1, rows  # no header, take it positionally
+
+    out: dict[str, str] = {}
+    for r in body:
+        if len(r) <= max(reg_i, code_i):
+            continue
+        reg = normalise_reg(r[reg_i])
+        code = (r[code_i] or "").strip().upper()
+        if reg and code:
+            out[reg] = code
+    return out
 
 
 def _report(rows: list[dict], expected: dict[str, str]) -> None:
@@ -786,6 +815,27 @@ def selftest() -> int:
         check("js has no unresolved braces", "{{" not in js and "}}" not in js)
     check("ko probe references the input", SEL_INPUT in KO_READY_JS)
 
+    import tempfile
+    want = {"GM14DKE": "LA7N", "WP09UOU": "LZ9Y"}
+    shapes = {
+        "bom header": "\ufeffreg,code\nGM14DKE,LA7N\nWP09UOU,LZ9Y\n",
+        "plain header": "reg,code\nGM14DKE,LA7N\nWP09UOU,LZ9Y\n",
+        "no header": "GM14DKE,LA7N\nWP09UOU,LZ9Y\n",
+        "alt names": "registration,paint_code\nGM14DKE,LA7N\nWP09UOU,LZ9Y\n",
+        "extra columns": ("reg,make,code,notes\nGM14DKE,VW,LA7N,dealer\n"
+                          "WP09UOU,Audi,LZ9Y,dealer\n"),
+        "spaced regs": "reg,code\ngm14 dke,la7n\nWP09 UOU,lz9y\n",
+        "blank lines": "reg,code\n\nGM14DKE,LA7N\n\nWP09UOU,LZ9Y\n\n",
+    }
+    with tempfile.TemporaryDirectory() as d:
+        for label, text in shapes.items():
+            f = Path(d) / "v.csv"
+            f.write_text(text, encoding="utf-8")
+            check(f"expected csv, {label}", _load_expected(f) == want)
+        f = Path(d) / "empty.csv"
+        f.write_text("", encoding="utf-8")
+        check("empty csv yields nothing", _load_expected(f) == {})
+
     print()
     if fails:
         print(f"{len(fails)} FAILURES")
@@ -816,12 +866,29 @@ def main() -> int:
 
     expected: dict[str, str] = {}
     regs = [normalise_reg(r) for r in a.regs]
+
     if a.expect:
-        expected = _load_expected(Path(a.expect))
+        path = Path(a.expect)
+        if not path.exists():
+            print(f"{path} not found. Write it first: two columns, one car per "
+                  f"line, where code is the dealer confirmed answer you are "
+                  f"checking against, not one this site gave you.\n\n"
+                  f"reg,code\nGM14DKE,LA7N\n")
+            return 2
+        expected = _load_expected(path)
+        if not expected:
+            print(f"{path} has no usable rows. It needs a header line with "
+                  f"reg and code columns.")
+            return 2
         regs += list(expected)
+
     if a.file:
+        path = Path(a.file)
+        if not path.exists():
+            print(f"{path} not found. It is a plain text file, one reg per line.")
+            return 2
         regs += [normalise_reg(ln) for ln in
-                 Path(a.file).read_text(encoding="utf-8").splitlines()]
+                 path.read_text(encoding="utf-8-sig").splitlines()]
     regs = [r for r in dict.fromkeys(regs) if 2 <= len(r) <= 8]
     if not regs:
         ap.print_help()
