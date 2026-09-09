@@ -642,13 +642,16 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict,
                 row.update(fast)
                 return row
 
-            if seeded and not trace.get("recovered"):
+            # A seeded key can be refused again later: sessions expire, and a
+            # long run outlives one. Recovery is rate limited rather than
+            # once-only, so a mid-run expiry does not fail every remaining reg.
+            recovered_recently = (time.monotonic() - trace.get("recovered_at", 0)) < 60
+            if seeded and not recovered_recently:
                 # The invented key was refused. Get a real one from the page
                 # once, then this run carries on at full speed.
                 if debug:
                     print("  seeded key refused, taking a real session once")
-                trace["recovered"] = True
-                trace["seeded"] = False
+                trace["recovered_at"] = time.monotonic()
                 await page.goto(URL, wait_until="commit", timeout=60000)
                 await _wait_for_form_key(ctx, 15.0)
                 before = await _cookie_value(ctx)
@@ -932,6 +935,12 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                 return
             trace["xhr"] += 1
 
+            # The fast path already has the body from the page. Re-reading it
+            # over CDP is a second copy of every lookup response for nothing,
+            # so only do it when the form path or --debug will actually use it.
+            if not (debug or slow):
+                return
+
             text = None
             try:
                 text = await resp.text()
@@ -1027,6 +1036,15 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                 reg = queue.pop(0)
                 n += 1
                 row = await lookup_one(page, ctx, reg, debug, trace, slow)
+                if row["outcome"] in ("error", "timeout"):
+                    # One retry. A blip should not cost a reg, and the outcome
+                    # is recorded either way so a real fault still shows.
+                    if debug:
+                        print(f"  {row['outcome']} on {reg}, retrying once")
+                    await asyncio.sleep(1.0)
+                    retry = await lookup_one(page, ctx, reg, debug, trace, slow)
+                    if retry["outcome"] not in ("error", "timeout"):
+                        row = retry
                 if row.get("source") == "fetch:json":
                     trace["json_ok"] = True
                 emit(n, row)
@@ -1091,11 +1109,20 @@ def _append_csv(path: Path, row: dict) -> None:
 
 # utf-8-sig everywhere: PowerShell writes a BOM with -Encoding utf8, which
 # turns the first column name into "\ufeffreg" and silently drops every row.
+# Outcomes that are an answer. Anything else is the run failing, not the site
+# answering, and must be retried on the next run rather than skipped forever.
+CONCLUSIVE = {"ok", "not_found", "unknown_vehicle"}
+
+
 def _done_regs(path: Path) -> set[str]:
+    """Only regs the site actually answered for. A reg that timed out or hit a
+    network blip stays in the queue; skipping it because a row exists would
+    quietly drop it from every future run."""
     if not path.exists():
         return set()
     with path.open(newline="", encoding="utf-8-sig") as fh:
-        return {r["reg"] for r in csv.DictReader(fh) if r.get("reg")}
+        return {r["reg"] for r in csv.DictReader(fh)
+                if r.get("reg") and (r.get("outcome") or "") in CONCLUSIVE}
 
 
 REG_HEADERS = {"reg", "registration", "reg_no", "regno", "vrm", "plate"}
@@ -1258,6 +1285,20 @@ def selftest() -> int:
     hit = row_from_response({"ok": True, "status": 200, "text": json.dumps(
         {"paint_code": "A7N", "colour": "GREY",
          "vehicle_details": "Volkswagen Golf 2014"})}, False)
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _d:
+        _f = Path(_d) / "r.csv"
+        _f.write_text("reg,outcome,code,colour,vehicle,source,detail,ms\n"
+                      "A1,ok,A7N,,,fetch:json,,1\n"
+                      "B2,not_found,,,,fetch:json,,1\n"
+                      "C3,unknown_vehicle,,,,fetch:json,,1\n"
+                      "D4,timeout,,,,,,1\n"
+                      "E5,error,,,,,,1\n"
+                      "F6,blocked,,,,,,1\n", encoding="utf-8")
+        check("resume skips answered regs", _done_regs(_f) == {"A1", "B2", "C3"})
+        check("resume retries failed regs",
+              not ({"D4", "E5", "F6"} & _done_regs(_f)))
+
     check("json body answers", hit and hit["source"] == "fetch:json"
           and hit["code"] == "A7N")
     miss = row_from_response({"ok": True, "status": 200, "text": json.dumps(
