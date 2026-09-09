@@ -3,7 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
-NOTES.md
+*.md
 
 # holds cf_clearance and the live session cookies
 .profile/
