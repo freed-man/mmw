@@ -957,7 +957,11 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                                    "status": resp.status, "post": req.post_data,
                                    "body": body})
 
-        page.on("response", lambda r: pending.append(asyncio.create_task(on_response(r))))
+        # Only attached when something reads it. On the fast path the fetch
+        # reports its own status, so this would be a task and a closure per
+        # response, held for the whole run, to populate fields nothing uses.
+        if debug or slow:
+            page.on("response", lambda r: pending.append(asyncio.create_task(on_response(r))))
         page.on("framenavigated", lambda f: trace.__setitem__("navigated", True)
                 if f == page.main_frame else None)
         page.on("console", lambda m: trace["console"].append(f"{m.type}: {m.text}")
@@ -1010,9 +1014,9 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
 
         def emit(n: int, row: dict) -> None:
             rows.append(row)
+            note = csv_safe(row["vehicle"] or row["detail"] or "") or ""
             print(f"[{n}/{len(regs)}] {row['reg']:<8} {row['outcome']:<10} "
-                  f"{row['code'] or '':<8} {row['ms']:>5}ms  "
-                  f"{row['vehicle'] or row['detail'] or ''}")
+                  f"{csv_safe(row['code']) or '':<8} {row['ms']:>5}ms  {note[:90]}")
             if out:
                 _append_csv(out, row)
 
@@ -1098,13 +1102,29 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
 FIELDS = ["reg", "outcome", "code", "colour", "vehicle", "source", "detail", "ms"]
 
 
+CSV_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value):
+    """Every text field here comes from their server. A value beginning = + - @
+    is a live formula the moment the file is opened in a spreadsheet, and the
+    detail column carries their error strings verbatim. Prefix those, and drop
+    control characters that would otherwise reach a terminal."""
+    if not isinstance(value, str):
+        return value
+    clean = "".join(c for c in value if c == "\t" or ord(c) >= 32)
+    if clean[:1] in CSV_TRIGGERS:
+        clean = "'" + clean
+    return clean
+
+
 def _append_csv(path: Path, row: dict) -> None:
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=FIELDS)
         if new:
             w.writeheader()
-        w.writerow({k: row.get(k) for k in FIELDS})
+        w.writerow({k: csv_safe(row.get(k)) for k in FIELDS})
 
 
 # utf-8-sig everywhere: PowerShell writes a BOM with -Encoding utf8, which
@@ -1299,6 +1319,15 @@ def selftest() -> int:
         check("resume retries failed regs",
               not ({"D4", "E5", "F6"} & _done_regs(_f)))
 
+    check("formula prefix is neutralised", csv_safe("=1+1").startswith("'"))
+    check("minus prefix is neutralised", csv_safe("-2+3").startswith("'"))
+    check("at prefix is neutralised", csv_safe("@SUM(A1)").startswith("'"))
+    check("ordinary text is untouched",
+          csv_safe("Sorry, vehicle X not found.") == "Sorry, vehicle X not found.")
+    check("escape sequences are stripped", "\x1b" not in csv_safe("a\x1b[31mb"))
+    check("tabs survive", csv_safe("a\tb") == "a\tb")
+    check("non strings pass through", csv_safe(None) is None and csv_safe(7) == 7)
+
     check("json body answers", hit and hit["source"] == "fetch:json"
           and hit["code"] == "A7N")
     miss = row_from_response({"ok": True, "status": 200, "text": json.dumps(
@@ -1359,7 +1388,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="reg to paint code")
     ap.add_argument("regs", nargs="*")
     ap.add_argument("--file", help="text file, one reg per line")
-    ap.add_argument("--out", default="results.csv")
+    ap.add_argument("--out", default=None,
+                    help="csv to append to (default: named after the input file)")
     ap.add_argument("--expect", help="csv with reg,code columns for an accuracy run")
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--profile", help="persistent chrome profile dir, keeps clearance")
@@ -1415,7 +1445,19 @@ def main() -> int:
         ap.print_help()
         return 2
 
-    out = Path(a.out) if (a.file or a.expect or len(regs) > 1) else None
+    if a.out:
+        out = Path(a.out)
+    elif a.file or a.expect:
+        # Derived from the input, because resume skips regs already present:
+        # an accuracy run sharing results.csv would silently exclude those
+        # cars from a later coverage run.
+        out = Path(a.file or a.expect).with_suffix(".csv")
+        if out == Path(a.file or a.expect):
+            out = out.with_name(out.stem + "-results.csv")
+    elif len(regs) > 1:
+        out = Path("results.csv")
+    else:
+        out = None
     if out and not a.no_resume:
         done = _done_regs(out)
         if any(r in done for r in regs):
