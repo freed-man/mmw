@@ -1,27 +1,58 @@
 """
-mmw.py  reg to paint code. One page held open, one reg after another.
+mmw.py  reg to paint code.
 
-    python mmw.py GM14DKE --headed              one reg, prints JSON
-    python mmw.py GM14DKE --headed --debug      full diagnostic report
-    python mmw.py --file regs.txt               batch, appends to results.csv
-    python mmw.py --file regs.txt --expect verified.csv    accuracy run
+    python mmw.py GM14DKE                       one reg, prints JSON
+    python mmw.py GM14DKE --debug               full diagnostic report
+    python mmw.py --file regs.txt               batch, writes regs.csv
+    python mmw.py --file regs.txt --concurrency 4 --delay 1
+    python mmw.py --expect verified.csv         accuracy run against known codes
     python mmw.py --selftest                    pure function checks, no network
 
-The answer is read from the site's own `paint_search_data` cookie, written on
-every successful lookup:
+HOW A LOOKUP HAPPENS
 
-    {"vehicle_details":"Volkswagen Golf 2014 1.6 Diesel",
-     "colour":"GREY","paint_code":"A7N","reg_no":"gm14dke"}
+The widget POSTs to an endpoint of its own, and that is what this calls:
 
-It carries the reg it belongs to, so it is only accepted when `reg_no` matches
-the reg just submitted. Structured DOM read of the result panel is the fallback.
+    POST /paintmatching/colour/search
+    data[registration]=<REG>&data[form_key]=<key>&form_key=<key>
 
-The widget is Knockout. The form's submit handler and the input's value binding
-do not exist until KO applies its bindings, and clicking go before that moment
-makes the browser do a plain native form submit: the page reloads with the reg
-in the query string, KO starts fresh with an empty field, and nothing ever
-appears. So every lookup waits for KO to own the input before touching it, and
-a navigation after submit is reported rather than waited out.
+The call is made from a page on the site's origin, so it carries the same
+cookies and session the form submit would have. Magento generates `form_key` in
+JavaScript, and the server validates by comparing the two copies in the body
+rather than against the session, so the cookie is written here and their page
+never has to load. What loads instead is a few hundred bytes of JSON on the
+same origin, purely to host the call.
+
+FOUR WAYS AN ANSWER ARRIVES, in the order they are tried
+
+    fetch:json    the endpoint's response body carries the code. Normal.
+    fetch:cookie  the body settled nothing, but the endpoint also writes
+                  `paint_search_data`, which carries the reg it belongs to and
+                  is only accepted when that matches. Cannot be parallelised:
+                  one cookie cannot answer for four regs at once.
+    (recovery)    a seeded form_key can be refused. One real session is taken
+                  from the page, then the run continues at full speed.
+    form + dom    everything above failed, so the page is loaded properly and
+                  the widget driven by hand, reading `.selected-paint-vrm-
+                  details`. This is Knockout, and its submit handler does not
+                  exist until KO applies its bindings; clicking before that
+                  makes the browser do a native form submit that reloads the
+                  page with the reg in the query string and no result. So this
+                  path waits for KO to own the input before touching it.
+
+The form path has never fired in practice. It is insurance against them moving
+the endpoint, and it is untested insurance.
+
+OUTCOMES
+
+    ok               a code, from whichever source the `source` column names
+    not_found        the vehicle resolved, they have no paint data for it
+    unknown_vehicle  their vehicle lookup did not recognise the reg
+    blocked          403 from the edge, or a challenge page. The run stops.
+    timeout          nothing arrived within the deadline
+    error            selectors stale, or an exception type
+
+Only the first three count as answered: a rerun with `--out` skips those and
+retries the rest.
 """
 
 from __future__ import annotations
@@ -56,14 +87,19 @@ LOOKUP_PATH = "/paintmatching/colour/search"
 LIGHT_URL = ("https://www.mymotorworld.com/customer/section/load/"
              "?sections=paint-data")
 
-DEADLINE_S = 25.0
-KO_DEADLINE_S = 25.0
-POLL_S = 0.12
-POPUP_EVERY = 6          # poll iterations between popup probes
-RESUBMIT_AFTER_S = 8.0
-DELAY_S = (2.0, 4.0)      # overridable with --delay
-RELOAD_EVERY = 40
+DELAY_S = (2.0, 4.0)       # between lookups, overridable with --delay
 
+# Everything below here belongs to the form fallback and is unused on the
+# normal path. Left at generous values because when it runs at all, something
+# has already gone wrong and finishing slowly beats failing fast.
+DEADLINE_S = 25.0          # wait for a result after submitting the form
+KO_DEADLINE_S = 25.0       # wait for Knockout to bind the widget
+POLL_S = 0.12              # between checks while waiting
+POPUP_EVERY = 6            # poll iterations between popup probes
+RESUBMIT_AFTER_S = 8.0     # press go a second time after this long
+RELOAD_EVERY = 40          # full page reload every N lookups
+
+# Selectors, all from the live markup, all used by the form fallback only.
 SEL_INPUT = "#paint-vrm-reg"
 SEL_GO = "#paint-vrm-search"
 SEL_RESET = "#vrm-remove, #paint-vrm-reset"
@@ -100,12 +136,6 @@ NOT_FOUND_MARKERS = ("not found", "check entry", "no match", "unable to find",
 # part: "vehicle X not found" is their vehicle lookup failing, "couldn't find
 # paints for X" is the vehicle resolving with no paint data behind it.
 UNKNOWN_VEHICLE_MARKERS = ("vehicle", "not found")
-
-BLOCK_FRAGMENTS = (
-    "googletagmanager", "google-analytics", "doubleclick", "facebook.net",
-    "clarity.ms", "bat.bing.com", "klaviyo", "smartech", "netcorecloud",
-    "hotjar", "tiktok", "nr-data.net", "js-agent.newrelic.com", "reviews.co.uk",
-)
 
 CF_MARKERS = ("just a moment", "attention required", "cf-challenge",
               "checking your browser", "verify you are human",
@@ -626,17 +656,17 @@ async def _lookup_via_fetch(page, ctx, reg: str, before: Optional[str],
 
 
 async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict,
-                     slow: bool = False) -> dict:
+                     state: dict, use_form: bool = False) -> dict:
     started = time.monotonic()
     row: dict[str, Any] = blank_row(reg)
     try:
-        if not slow:
+        if not use_form:
             before = await _cookie_value(ctx)
             try:
                 await page.evaluate(CLEAR_COOKIE_JS)
             except Exception:
                 pass
-            seeded = trace.get("seeded", False)
+            seeded = state.get("seeded", False)
             fast = await _lookup_via_fetch(page, ctx, reg, before, debug, seeded)
             if fast:
                 row.update(fast)
@@ -645,13 +675,13 @@ async def lookup_one(page, ctx, reg: str, debug: bool, trace: dict,
             # A seeded key can be refused again later: sessions expire, and a
             # long run outlives one. Recovery is rate limited rather than
             # once-only, so a mid-run expiry does not fail every remaining reg.
-            recovered_recently = (time.monotonic() - trace.get("recovered_at", 0)) < 60
+            recovered_recently = (time.monotonic() - state.get("recovered_at", 0)) < 60
             if seeded and not recovered_recently:
                 # The invented key was refused. Get a real one from the page
                 # once, then this run carries on at full speed.
                 if debug:
                     print("  seeded key refused, taking a real session once")
-                trace["recovered_at"] = time.monotonic()
+                state["recovered_at"] = time.monotonic()
                 await page.goto(URL, wait_until="commit", timeout=60000)
                 await _wait_for_form_key(ctx, 15.0)
                 before = await _cookie_value(ctx)
@@ -828,36 +858,49 @@ async def _debug_report(page, ctx, trace: dict) -> None:
 
 
 async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
-              profile: Optional[str], chromium_only: bool,
-              block_assets: bool, offscreen: bool, slow: bool,
-              delay: Optional[float], concurrency: int) -> list[dict]:
+              profile: Optional[str], slow: bool, delay: Optional[float],
+              concurrency: int) -> list[dict]:
     from playwright.async_api import async_playwright
 
     rows: list[dict] = []
     timings: dict = {"launch": 0.0, "page": 0.0, "driver": 0.0, "close": 0.0,
                      "via": "full page"}
     started_all = time.monotonic()
+    # What happened, for --debug and for error messages. Read, never obeyed.
     trace: dict = {"xhr": 0, "forbidden": 0, "navigated": False,
                    "calls": [], "console": [], "cf": {}, "search": None}
+    # What the run has learned, and acts on. Kept apart from the trace so it is
+    # obvious which dict decides behaviour.
+    #   seeded       the form_key was invented here, so a 403 means a refused
+    #                key rather than a blocked client
+    #   json_ok      the endpoint answered in its response body at least once,
+    #                which is what makes batching safe
+    #   recovered_at when a real session was last fetched, to rate limit it
+    state: dict = {"seeded": False, "json_ok": False, "recovered_at": 0.0}
 
+    # `slow` is what was asked for; `use_form` is where the run actually is.
+    # They differ when the fast path cannot get a session and falls back.
+    use_form = slow
+
+    t_driver = time.monotonic()
     async with async_playwright() as p:
+        timings["driver"] = time.monotonic() - t_driver
         # --enable-automation and navigator.webdriver are read by bot
         # management. Real Chrome is preferred over bundled Chromium for the
         # same reason; fall back if it is not installed.
         t_launch = time.monotonic()
+        # If headless is ever detected again, a real headed browser parked at
+        # --window-position=-32000,-32000 is invisible without being headless.
         args = ["--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled"]
-        if offscreen:
-            # A genuine headed browser parked off the visible desktop. Nothing
-            # to fingerprint, because nothing about it is headless.
-            args.append("--window-position=-32000,-32000")
         launch: dict = {
-            "headless": False if offscreen else not headed,
+            "headless": not headed,
             "args": args,
             "ignore_default_args": ["--enable-automation"],
         }
-        if not chromium_only:
-            launch["channel"] = "chrome"
+        # Real Chrome, not bundled Chromium: bundled gets 403 on every request
+        # here. Falls back below only if Chrome is not installed at all.
+        launch["channel"] = "chrome"
         if profile:
             try:
                 ctx = await p.chromium.launch_persistent_context(
@@ -904,18 +947,9 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
 
         await ctx.route(PUSH_HOSTS, kill)
 
-        # Interception rewrites every request, which is itself a signal. Off by
-        # default now; --block turns the tracker filtering back on.
-        if block_assets:
-            async def block(route, request):
-                if request.resource_type in ("image", "media", "font"):
-                    await route.abort()
-                elif any(f in request.url for f in BLOCK_FRAGMENTS):
-                    await route.abort()
-                else:
-                    await route.continue_()
-
-            await ctx.route("**/*", block)
+        # No blanket interception. Rewriting every request is itself a signal,
+        # and turning it on produced a 403 on every same origin request. Only
+        # the push vendor above is routed, and only because it is third party.
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
         pending: list[asyncio.Task] = []
@@ -938,7 +972,7 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
             # The fast path already has the body from the page. Re-reading it
             # over CDP is a second copy of every lookup response for nothing,
             # so only do it when the form path or --debug will actually use it.
-            if not (debug or slow):
+            if not (debug or use_form):
                 return
 
             text = None
@@ -960,7 +994,7 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
         # Only attached when something reads it. On the fast path the fetch
         # reports its own status, so this would be a task and a closure per
         # response, held for the whole run, to populate fields nothing uses.
-        if debug or slow:
+        if debug or use_form:
             page.on("response", lambda r: pending.append(asyncio.create_task(on_response(r))))
         page.on("framenavigated", lambda f: trace.__setitem__("navigated", True)
                 if f == page.main_frame else None)
@@ -968,7 +1002,7 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                 if m.type in ("error", "warning") else None)
 
         t_page = time.monotonic()
-        if slow:
+        if use_form:
             await page.goto(URL, wait_until="load", timeout=60000)
         else:
             timings["via"] = "seeded"
@@ -991,21 +1025,21 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                 await asyncio.wait_for(page.evaluate("window.stop()"), 2.0)
             except Exception:
                 pass
-            trace["seeded"] = timings["via"] == "seeded"
+            state["seeded"] = timings["via"] == "seeded"
             if not got_key:
                 print("no form_key cookie, falling back to the form path")
-                slow = True
+                use_form = True
                 await page.goto(URL, wait_until="load", timeout=60000)
         timings["page"] = time.monotonic() - t_page
         trace["navigated"] = False
 
-        if slow and await _blocked(page):
+        if use_form and await _blocked(page):
             print("challenge page on load. Run once with --headed --profile .profile, "
                   "clear it by hand, then rerun; the clearance persists.")
             await (browser.close() if browser else ctx.close())
             return rows
 
-        if slow:
+        if use_form:
             try:
                 if await page.locator(SEL_HAS_VEHICLE).count():
                     await _reset(page)
@@ -1033,24 +1067,24 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
         # batched, and guessing that would be guessing.
         while queue and not stopped:
             batch_size = 1
-            if concurrency > 1 and trace.get("json_ok") and not slow:
+            if concurrency > 1 and state.get("json_ok") and not use_form:
                 batch_size = min(concurrency, len(queue))
 
             if batch_size == 1:
                 reg = queue.pop(0)
                 n += 1
-                row = await lookup_one(page, ctx, reg, debug, trace, slow)
+                row = await lookup_one(page, ctx, reg, debug, trace, state, use_form)
                 if row["outcome"] in ("error", "timeout"):
                     # One retry. A blip should not cost a reg, and the outcome
                     # is recorded either way so a real fault still shows.
                     if debug:
                         print(f"  {row['outcome']} on {reg}, retrying once")
                     await asyncio.sleep(1.0)
-                    retry = await lookup_one(page, ctx, reg, debug, trace, slow)
+                    retry = await lookup_one(page, ctx, reg, debug, trace, state, use_form)
                     if retry["outcome"] not in ("error", "timeout"):
                         row = retry
                 if row.get("source") == "fetch:json":
-                    trace["json_ok"] = True
+                    state["json_ok"] = True
                 emit(n, row)
                 if debug:
                     await _debug_report(page, ctx, trace)
@@ -1060,18 +1094,18 @@ async def run(regs: list[str], headed: bool, out: Optional[Path], debug: bool,
                     break
                 if not (row.get("source") or "").startswith("fetch"):
                     await _reset(page)
-                if slow and n % RELOAD_EVERY == 0:
+                if use_form and n % RELOAD_EVERY == 0:
                     await page.goto(URL, wait_until="load")
                     await _wait_for_ko(page)
             else:
                 chunk = [queue.pop(0) for _ in range(batch_size)]
-                got = await lookup_batch(page, chunk, trace.get("seeded", False), debug)
+                got = await lookup_batch(page, chunk, state.get("seeded", False), debug)
                 for reg in chunk:
                     row = got.get(reg)
                     if row is None:
                         # Body settled nothing for this one; it earns a serial
                         # run rather than being written off.
-                        row = await lookup_one(page, ctx, reg, debug, trace, slow)
+                        row = await lookup_one(page, ctx, reg, debug, trace, state, use_form)
                     n += 1
                     emit(n, row)
                     if row["outcome"] == "blocked":
@@ -1391,7 +1425,8 @@ def main() -> int:
     ap.add_argument("--out", default=None,
                     help="csv to append to (default: named after the input file)")
     ap.add_argument("--expect", help="csv with reg,code columns for an accuracy run")
-    ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--headed", action="store_true",
+                    help="show the browser window instead of running headless")
     ap.add_argument("--profile", help="persistent chrome profile dir, keeps clearance")
     ap.add_argument("--debug", action="store_true", help="full diagnostic report")
     ap.add_argument("--slow", action="store_true",
@@ -1401,15 +1436,10 @@ def main() -> int:
                          "answer in its response body (default 1)")
     ap.add_argument("--delay", type=float, default=None,
                     help="mean seconds between lookups (default 3, jittered)")
-    ap.add_argument("--offscreen", action="store_true",
-                    help="real headed browser positioned off the desktop, "
-                         "invisible without being headless")
-    ap.add_argument("--chromium", action="store_true",
-                    help="use bundled chromium instead of installed Chrome")
-    ap.add_argument("--block", action="store_true",
-                    help="intercept and block trackers, faster but more detectable")
-    ap.add_argument("--no-resume", action="store_true")
-    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--no-resume", action="store_true",
+                    help="do not skip regs the output csv already answered for")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the pure function checks and exit, no network")
     a = ap.parse_args()
 
     if a.selftest:
@@ -1467,9 +1497,8 @@ def main() -> int:
         print("nothing to do")
         return 0
 
-    rows = asyncio.run(run(regs, a.headed, out, a.debug, a.profile,
-                           a.chromium, a.block, a.offscreen, a.slow, a.delay,
-                           max(1, a.concurrency)))
+    rows = asyncio.run(run(regs, a.headed, out, a.debug, a.profile, a.slow,
+                           a.delay, max(1, a.concurrency)))
     if expected:
         _report(rows, expected)
     elif len(rows) == 1 and not out:
